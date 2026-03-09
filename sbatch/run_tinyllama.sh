@@ -91,8 +91,9 @@ tasks=(
 # ============================================================================
 
 # --- Shared across all techniques ---
-BATCH_SIZE=16
-EVAL_BATCH_SIZE=16
+# batch=32, seq=128 → N=4096 (2× breakeven for FlashFFN recompute mode)
+BATCH_SIZE=32
+EVAL_BATCH_SIZE=32
 TOTAL_BATCH_SIZE=64
 WEIGHT_DECAY=0.01
 LR_SCHEDULER="linear"
@@ -191,6 +192,16 @@ is_wikitext_task() {
         wikitext2|wikitext103) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+get_job_resources() {
+    # Sets: gpu_type, gpu_mem
+    # TinyLlama (1.1B) fits comfortably in a 4g.40gb MIG slice.
+    local technique=$1
+    local base_tech=$(get_base_technique "$technique")
+
+    gpu_type="nvidia_h100_80gb_hbm3_4g.40gb:1"
+    gpu_mem="40000M"
 }
 
 is_flash_technique() {
@@ -401,6 +412,7 @@ for technique in "${techniques[@]}"; do
         job_name="${MODEL_SHORT}_${technique}_${task}"
         run_name="${technique}_${MODEL_SHORT}_${task}"
 
+        get_job_resources "$technique"
         python_cmd=$(build_python_cmd "$technique" "$task" "$epochs" "$run_name")
 
         if [[ "$LOCAL_MODE" == true ]]; then
@@ -425,8 +437,8 @@ for technique in "${techniques[@]}"; do
 #SBATCH --output=./logs/${job_name}_%j.out
 #SBATCH --error=./logs/${job_name}_%j.err
 #SBATCH --time=$time_limit
-#SBATCH --gres=gpu:1
-#SBATCH --mem=40000M
+#SBATCH --gres=gpu:$gpu_type
+#SBATCH --mem=$gpu_mem
 #SBATCH --cpus-per-task=4
 $account_line
 

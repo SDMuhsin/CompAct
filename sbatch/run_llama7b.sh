@@ -6,10 +6,10 @@
 # Submits Mo5 (median-of-five, seeds 41-45) benchmarks for PEFT methods with
 # and without FlashFFN on LLaMA-7B (SwiGLU, FlashFFN-compatible).
 #
-# 8 PEFT baselines + 6 FlashFFN variants = 14 techniques
-# FlashFFN only for methods with effective-weight paths:
-#   Full FT, LoRA, DoRA, AdaLoRA, DyLoRA, VeRA
-# FourierFT and Spectral fall back to gradient checkpointing (NOT FlashFFN).
+# 8 PEFT baselines + 1 Full FT + 7 FlashFFN variants = 16 techniques
+# PEFT targets attention only (q_proj, v_proj) → MLP frozen →
+# FlashFFN uses activations mode (always wins, no breakeven).
+# Full FT + FlashFFN excluded: MLP weights trainable → recompute mode → below breakeven.
 #
 # NOTE: LLaMA-7B requires significantly more GPU memory than TinyLlama.
 # Gradient checkpointing is enabled by default. Batch sizes are reduced.
@@ -53,9 +53,9 @@ done
 MODEL="huggyllama/llama-7b"
 MODEL_SHORT="llama7b"
 DTYPE="bfloat16"
-# NOTE: No --adapter_target_modules passed. train_glue.py defaults for LLaMA:
-# PEFT methods: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj (all 7)
-# This is required for FlashFFN effective-weight mode on MLP layers.
+# Attention-only PEFT targeting: q_proj,v_proj only.
+# MLP layers (gate/up/down_proj) stay frozen → FlashFFN activations mode (always wins).
+TARGET_MODULES="q_proj,v_proj"
 
 # Techniques to benchmark (comment/uncomment as needed)
 techniques=(
@@ -67,13 +67,15 @@ techniques=(
     "vera"
     "fourierft"
     "spectral"
-    # FlashFFN variants (only for methods with effective-weight paths)
-    "base_flash"
+    # FlashFFN variants — all use activations mode (MLP frozen, no breakeven)
+    # No base_flash: Full FT trains MLP weights → recompute mode → below breakeven
     "lora_flash"
     "dora_flash"
     "adalora_flash"
     "dylora_flash"
     "vera_flash"
+    "fourierft_flash"
+    "spectral_flash"
 )
 
 # Tasks to evaluate
@@ -221,12 +223,12 @@ get_epochs() {
 }
 
 get_job_resources() {
-    # Sets: gpu_mem, gpu_type
-    # LLaMA-7B needs a full 80GB GPU for Full FT, or 40GB for PEFT
+    # Sets: gpu_type, gpu_mem
+    # LLaMA-7B (14GB model weight in bf16) needs a full GPU.
     local technique=$1
-    local task=$2
     local base_tech=$(get_base_technique "$technique")
 
+    gpu_type="nvidia_h100_80gb_hbm3:1"
     if [[ "$base_tech" == "base" ]]; then
         gpu_mem="64000M"
     else
@@ -311,6 +313,11 @@ build_python_cmd() {
     common+=" --dtype $DTYPE"
     common+=" --name $run_name"
     common+=" $GRADIENT_CHECKPOINTING"
+
+    # Attention-only PEFT targeting (skip for Full FT which has no adapters)
+    if [[ "$base_tech" != "base" ]]; then
+        common+=" --adapter_target_modules $TARGET_MODULES"
+    fi
 
     # Task-specific overrides
     if is_wikitext_task "$task"; then
@@ -403,7 +410,7 @@ echo "Model:      $MODEL"
 echo "Techniques: ${techniques[*]}"
 echo "Tasks:      ${tasks[*]}"
 echo "Dtype:      $DTYPE"
-echo "Target:     architecture defaults (all 7 for LLaMA)"
+echo "Target:     $TARGET_MODULES (attention-only, activations mode)"
 echo "Grad ckpt:  enabled"
 echo "============================================"
 echo ""
@@ -443,7 +450,7 @@ for technique in "${techniques[@]}"; do
 #SBATCH --output=./logs/${job_name}_%j.out
 #SBATCH --error=./logs/${job_name}_%j.err
 #SBATCH --time=$time_limit
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:$gpu_type
 #SBATCH --mem=$gpu_mem
 #SBATCH --cpus-per-task=4
 $account_line
