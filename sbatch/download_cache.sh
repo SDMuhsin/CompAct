@@ -19,6 +19,7 @@ export HF_HOME=$(pwd)/data
 export HF_DATASETS_CACHE=$(pwd)/data
 export TRANSFORMERS_CACHE=$(pwd)/data
 export TORCH_HOME=$(pwd)/data
+export HF_HUB_DISABLE_XET=1
 mkdir -p $HF_HOME
 
 echo "Cache directory: $HF_HOME"
