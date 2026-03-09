@@ -14,3 +14,6 @@ lion-pytorch
 adapter-transformers
 peft
 galore-torch
+huggingface_hub
+sentencepiece
+scikit-learn
