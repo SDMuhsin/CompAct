@@ -228,7 +228,7 @@ get_job_resources() {
     local technique=$1
     local base_tech=$(get_base_technique "$technique")
 
-    gpu_type="nvidia_h100_80gb_hbm3:1"
+    gpu_type="h100:1"
     if [[ "$base_tech" == "base" ]]; then
         gpu_mem="64000M"
     else
@@ -450,7 +450,7 @@ for technique in "${techniques[@]}"; do
 #SBATCH --output=./logs/${job_name}_%j.out
 #SBATCH --error=./logs/${job_name}_%j.err
 #SBATCH --time=$time_limit
-#SBATCH --gres=gpu:$gpu_type
+#SBATCH --gpus=$gpu_type
 #SBATCH --mem=$gpu_mem
 #SBATCH --cpus-per-task=4
 $account_line
