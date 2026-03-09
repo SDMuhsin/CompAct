@@ -446,8 +446,6 @@ module load gcc arrow scipy-stack cuda cudnn
 source ./env/bin/activate
 
 export HF_HOME=\$(pwd)/data
-export HF_DATASETS_CACHE=\$(pwd)/data
-export TRANSFORMERS_CACHE=\$(pwd)/data
 export TORCH_HOME=\$(pwd)/data
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
