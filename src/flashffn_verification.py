@@ -430,7 +430,7 @@ def run_all_tests():
         else:
             return obj
 
-    with open("/workspace/actcomp/results/flashffn_verification.json", "w") as f:
+    with open("/workspace/CompAct/results/flashffn_verification.json", "w") as f:
         json.dump(convert_to_serializable(all_results), f, indent=2)
 
     print("\n  Results saved to /workspace/actcomp/results/flashffn_verification.json")

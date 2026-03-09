@@ -1,11 +1,17 @@
 """
-FlashFFN: Fused CUDA kernels for FFN with activation compression.
+FlashFFN: Memory-efficient FFN with activation compression.
 
-This module implements custom Triton kernels that achieve real memory savings
-by never materializing full intermediate tensors during FFN forward pass.
+Computes SwiGLU FFN exactly (bit-close to standard FFN) in the forward pass,
+but stores only compressed (top-K) intermediate activations for the backward pass.
 
-Key idea: Process tokens in tiles, compute SwiGLU, extract top-K for storage,
-and discard the full intermediate tensor before moving to the next tile.
+Key optimizations (v2 — fused Triton kernels, no Python tiling loop):
+- cuBLAS for all matmuls (via F.linear / torch.mm) — no custom Triton matmuls
+- Fused Triton kernels for element-wise SiLU*mul (forward) and SwiGLU backward
+- No Python tiling loop: full vectorized computation in a single pass
+- torch.topk for top-K compression (well-optimized CUDA implementation)
+
+Forward: 3 cuBLAS + 1 Triton + topK ops = ~8 kernel launches (was ~80 with tiling)
+Backward: 8 cuBLAS + 1 Triton + scatter = ~10 kernel launches (was ~120 with tiling)
 """
 
 import torch
@@ -22,426 +28,128 @@ import math
 # =============================================================================
 
 @triton.jit
-def _silu_kernel(
-    x_ptr,
+def _silu_mul_fwd_kernel(
+    gate_ptr,
+    up_ptr,
     out_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused SiLU activation: x * sigmoid(x)"""
+    """Fused SiLU(gate) * up → out.  Element-wise, 1-D grid."""
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # SiLU = x * sigmoid(x)
-    sigmoid_x = tl.sigmoid(x)
-    result = x * sigmoid_x
+    gate = tl.load(gate_ptr + offsets, mask=mask).to(tl.float32)
+    up = tl.load(up_ptr + offsets, mask=mask).to(tl.float32)
+
+    # silu(gate) = gate * sigmoid(gate)
+    act = gate * tl.sigmoid(gate)
+    result = act * up
+
     tl.store(out_ptr + offsets, result, mask=mask)
 
 
 @triton.jit
-def _swiglu_fused_kernel(
-    # Input
-    x_ptr,
-    # Weights
-    w_gate_ptr,
-    w_up_ptr,
-    # Output
-    h_mid_ptr,
-    # Dimensions
-    batch_seq,
-    hidden_dim,
-    intermediate_dim,
-    # Strides
-    stride_x_row,
-    stride_wg_row, stride_wg_col,
-    stride_wu_row, stride_wu_col,
-    stride_out_row,
-    # Block sizes
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """
-    Fused SwiGLU computation: h_mid = SiLU(x @ W_gate.T) * (x @ W_up.T)
-
-    This kernel computes both projections and the SwiGLU activation in one pass.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    # Compute starting positions
-    m_start = pid_m * BLOCK_M
-    n_start = pid_n * BLOCK_N
-
-    # Initialize accumulators for gate and up projections
-    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # Iterate over K dimension
-    for k_start in range(0, hidden_dim, BLOCK_K):
-        # Load x tile: (BLOCK_M, BLOCK_K)
-        x_offsets_m = m_start + tl.arange(0, BLOCK_M)
-        x_offsets_k = k_start + tl.arange(0, BLOCK_K)
-        x_ptrs = x_ptr + x_offsets_m[:, None] * stride_x_row + x_offsets_k[None, :]
-        x_mask = (x_offsets_m[:, None] < batch_seq) & (x_offsets_k[None, :] < hidden_dim)
-        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
-
-        # Load W_gate tile: (BLOCK_K, BLOCK_N) - note: W_gate is (intermediate, hidden)
-        # We want x @ W_gate.T, so we load W_gate as (hidden, intermediate) effectively
-        wg_offsets_k = k_start + tl.arange(0, BLOCK_K)
-        wg_offsets_n = n_start + tl.arange(0, BLOCK_N)
-        wg_ptrs = w_gate_ptr + wg_offsets_n[None, :] * stride_wg_row + wg_offsets_k[:, None] * stride_wg_col
-        wg_mask = (wg_offsets_k[:, None] < hidden_dim) & (wg_offsets_n[None, :] < intermediate_dim)
-        wg_tile = tl.load(wg_ptrs, mask=wg_mask, other=0.0)
-
-        # Load W_up tile: (BLOCK_K, BLOCK_N)
-        wu_ptrs = w_up_ptr + wg_offsets_n[None, :] * stride_wu_row + wg_offsets_k[:, None] * stride_wu_col
-        wu_mask = wg_mask
-        wu_tile = tl.load(wu_ptrs, mask=wu_mask, other=0.0)
-
-        # Accumulate: x @ W.T
-        acc_gate += tl.dot(x_tile, wg_tile)
-        acc_up += tl.dot(x_tile, wu_tile)
-
-    # Apply SiLU to gate and multiply with up
-    h_gate = acc_gate.to(tl.float16)
-    h_up = acc_up.to(tl.float16)
-    h_act = h_gate * tl.sigmoid(h_gate)  # SiLU
-    h_mid = h_act * h_up
-
-    # Store result
-    out_offsets_m = m_start + tl.arange(0, BLOCK_M)
-    out_offsets_n = n_start + tl.arange(0, BLOCK_N)
-    out_ptrs = h_mid_ptr + out_offsets_m[:, None] * stride_out_row + out_offsets_n[None, :]
-    out_mask = (out_offsets_m[:, None] < batch_seq) & (out_offsets_n[None, :] < intermediate_dim)
-    tl.store(out_ptrs, h_mid, mask=out_mask)
-
-
-@triton.jit
-def _topk_per_row_kernel(
-    # Input
-    x_ptr,
-    # Output
-    values_ptr,
-    indices_ptr,
-    # Dimensions
-    n_rows,
-    n_cols,
-    k,
-    # Strides
-    stride_x_row,
-    stride_val_row,
-    stride_idx_row,
-    # Block size
+def _swiglu_bwd_kernel(
+    # Inputs (read)
+    grad_hmid_ptr,
+    hgate_ptr,
+    hup_ptr,
+    # Outputs (write)
+    grad_hgate_ptr,
+    grad_hup_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Extract top-K values per row using a simple selection approach.
-    For each row, we iterate and keep track of top-K.
+    Fused backward through h_mid = SiLU(h_gate) * h_up.
 
-    Note: This is a simplified version. For production, consider:
-    - Bitonic sort for larger K
-    - Radix select for very large dimensions
+    Computes:
+      grad_h_up   = grad_h_mid * silu(h_gate)
+      grad_h_gate = grad_h_mid * h_up * silu'(h_gate)
+    where silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
     """
-    row_id = tl.program_id(0)
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
 
-    if row_id >= n_rows:
-        return
+    grad_hmid = tl.load(grad_hmid_ptr + offsets, mask=mask).to(tl.float32)
+    hgate = tl.load(hgate_ptr + offsets, mask=mask).to(tl.float32)
+    hup = tl.load(hup_ptr + offsets, mask=mask).to(tl.float32)
 
-    # For each position in top-K, find the next largest
-    # This is O(k * n) but simple and works for moderate k
+    # Forward recomputation
+    sig = tl.sigmoid(hgate)
+    h_act = hgate * sig  # silu(h_gate)
 
-    # We'll use a different approach: load all values, do partial sort
-    # For now, implement a simple threshold-based approach
+    # Backward through h_mid = h_act * h_up
+    grad_h_act = grad_hmid * hup
+    grad_h_up = grad_hmid * h_act
 
-    # Load the entire row (assuming it fits in SRAM)
-    row_start = row_id * stride_x_row
+    # Backward through silu: silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+    dsilu = sig * (1.0 + hgate * (1.0 - sig))
+    grad_h_gate = grad_h_act * dsilu
 
-    # Initialize output arrays
-    # We'll find top-k by iterating k times, each time finding max of remaining
-
-    # For efficiency with Triton, we use a vectorized approach:
-    # 1. Load values in blocks
-    # 2. Track which indices we've selected
-    # 3. Use masking to exclude selected indices
-
-    # Simple approach: compute absolute values, find threshold, then gather
-    # This works well for sparse data where we want largest magnitude
-
-    for k_idx in range(k):
-        max_val = tl.full((1,), float('-inf'), dtype=tl.float32)
-        max_idx = tl.full((1,), 0, dtype=tl.int32)
-
-        for block_start in range(0, n_cols, BLOCK_SIZE):
-            offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_cols
-
-            vals = tl.load(x_ptr + row_start + offsets, mask=mask, other=float('-inf'))
-            abs_vals = tl.abs(vals)
-
-            # Check if already selected (by setting to -inf after selection)
-            # Find max in this block
-            block_max = tl.max(abs_vals)
-
-            if block_max > max_val:
-                # Find the index of max
-                is_max = abs_vals == block_max
-                # Get first index where is_max is true
-                idx = tl.where(is_max, offsets, n_cols)
-                local_max_idx = tl.min(idx)
-                if local_max_idx < n_cols:
-                    max_val = block_max
-                    max_idx = local_max_idx
-
-        # Store the k-th largest
-        actual_val = tl.load(x_ptr + row_start + max_idx)
-        tl.store(values_ptr + row_id * stride_val_row + k_idx, actual_val)
-        tl.store(indices_ptr + row_id * stride_idx_row + k_idx, max_idx.to(tl.int16))
-
-        # Mark as used by setting to -inf (we'll restore later or use copy)
-        tl.store(x_ptr + row_start + max_idx, float('-inf'))
-
-
-@triton.jit
-def _fused_ffn_forward_tiled_kernel(
-    # Inputs
-    x_ptr,
-    w_gate_ptr,
-    w_up_ptr,
-    w_down_ptr,
-    # Outputs
-    y_ptr,
-    values_ptr,
-    indices_ptr,
-    # Dimensions
-    batch_seq,
-    hidden_dim,
-    intermediate_dim,
-    k,  # top-k per token
-    # Strides for x: (batch_seq, hidden_dim)
-    stride_x_row,
-    # Strides for weights
-    stride_wg_row, stride_wg_col,  # W_gate: (intermediate, hidden)
-    stride_wu_row, stride_wu_col,  # W_up: (intermediate, hidden)
-    stride_wd_row, stride_wd_col,  # W_down: (hidden, intermediate)
-    # Strides for outputs
-    stride_y_row,
-    stride_val_row,
-    stride_idx_row,
-    # Tile sizes
-    TILE_M: tl.constexpr,  # tokens per tile
-    BLOCK_K: tl.constexpr,  # hidden dim block
-    BLOCK_N: tl.constexpr,  # intermediate dim block
-):
-    """
-    Fully fused FFN forward pass with activation compression.
-
-    For each tile of tokens:
-    1. Compute h_mid = SiLU(x @ W_gate.T) * (x @ W_up.T)
-    2. Compute y = h_mid @ W_down.T
-    3. Extract top-K from h_mid
-    4. Discard full h_mid
-
-    This kernel processes TILE_M tokens at a time, never materializing
-    the full (batch_seq, intermediate_dim) tensor.
-    """
-    tile_id = tl.program_id(0)
-
-    # Token range for this tile
-    m_start = tile_id * TILE_M
-    m_end = tl.minimum(m_start + TILE_M, batch_seq)
-    actual_tile_size = m_end - m_start
-
-    if m_start >= batch_seq:
-        return
-
-    # We need to compute h_mid for this tile, then immediately:
-    # 1. Compute output contribution
-    # 2. Extract top-K
-    # 3. Discard
-
-    # Due to Triton limitations, we'll compute in blocks of intermediate dim
-    # and accumulate. This is memory-efficient as we only keep tile-sized buffers.
-
-    # For each token in tile, we need full intermediate dim to do top-K
-    # So we compute full h_mid for tile, but only TILE_M tokens at a time
-
-    # Process each token in the tile
-    for local_m in range(TILE_M):
-        m_idx = m_start + local_m
-        if m_idx >= batch_seq:
-            break
-
-        # Accumulators for this single token's intermediate representation
-        # We'll compute in chunks of BLOCK_N and track top-K online
-
-        # For output y, we need to accumulate: y = sum over n of (h_mid[n] * W_down[:, n])
-        y_acc = tl.zeros((hidden_dim,), dtype=tl.float32)
-
-        # For top-K, we track k largest values and their indices
-        # Initialize with -inf
-        topk_vals = tl.full((k,), float('-inf'), dtype=tl.float32)
-        topk_idxs = tl.zeros((k,), dtype=tl.int32)
-
-        # Process intermediate dimension in blocks
-        for n_start in range(0, intermediate_dim, BLOCK_N):
-            n_offsets = n_start + tl.arange(0, BLOCK_N)
-            n_mask = n_offsets < intermediate_dim
-
-            # Compute h_gate[m, n_start:n_start+BLOCK_N]
-            # h_gate = sum_k x[m,k] * W_gate[n,k]
-            gate_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-            up_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-
-            for k_start in range(0, hidden_dim, BLOCK_K):
-                k_offsets = k_start + tl.arange(0, BLOCK_K)
-                k_mask = k_offsets < hidden_dim
-
-                # Load x[m, k_start:k_start+BLOCK_K]
-                x_vals = tl.load(
-                    x_ptr + m_idx * stride_x_row + k_offsets,
-                    mask=k_mask,
-                    other=0.0
-                )
-
-                # Load W_gate[n_start:n_start+BLOCK_N, k_start:k_start+BLOCK_K]
-                # W_gate has shape (intermediate, hidden), stride (stride_wg_row, stride_wg_col)
-                wg_ptrs = w_gate_ptr + n_offsets[:, None] * stride_wg_row + k_offsets[None, :] * stride_wg_col
-                wg_mask = n_mask[:, None] & k_mask[None, :]
-                wg_vals = tl.load(wg_ptrs, mask=wg_mask, other=0.0)
-
-                # Load W_up[n_start:n_start+BLOCK_N, k_start:k_start+BLOCK_K]
-                wu_ptrs = w_up_ptr + n_offsets[:, None] * stride_wu_row + k_offsets[None, :] * stride_wu_col
-                wu_vals = tl.load(wu_ptrs, mask=wg_mask, other=0.0)
-
-                # Accumulate: gate[n] += sum_k x[k] * W_gate[n, k]
-                gate_acc += tl.sum(wg_vals * x_vals[None, :], axis=1)
-                up_acc += tl.sum(wu_vals * x_vals[None, :], axis=1)
-
-            # Apply SwiGLU: h_mid = SiLU(gate) * up
-            h_gate = gate_acc.to(tl.float16)
-            h_up = up_acc.to(tl.float16)
-            h_act = h_gate * tl.sigmoid(h_gate)
-            h_mid_block = h_act * h_up  # (BLOCK_N,)
-
-            # Accumulate output: y += h_mid_block @ W_down.T[n_block, :]
-            # W_down has shape (hidden, intermediate)
-            # We want y[h] = sum_n h_mid[n] * W_down[h, n]
-            for h_start in range(0, hidden_dim, BLOCK_K):
-                h_offsets = h_start + tl.arange(0, BLOCK_K)
-                h_mask = h_offsets < hidden_dim
-
-                # Load W_down[h_start:h_start+BLOCK_K, n_start:n_start+BLOCK_N]
-                wd_ptrs = w_down_ptr + h_offsets[:, None] * stride_wd_row + n_offsets[None, :] * stride_wd_col
-                wd_mask = h_mask[:, None] & n_mask[None, :]
-                wd_vals = tl.load(wd_ptrs, mask=wd_mask, other=0.0)
-
-                # y[h] += sum_n h_mid[n] * W_down[h, n]
-                contrib = tl.sum(wd_vals * h_mid_block.to(tl.float32)[None, :], axis=1)
-                y_acc = tl.where(h_mask, y_acc[h_offsets - h_start] + contrib, y_acc[h_offsets - h_start])
-                # Note: This indexing is tricky in Triton, we need to be careful
-
-            # Update top-K tracking
-            # For each value in h_mid_block, check if it should be in top-K
-            h_mid_abs = tl.abs(h_mid_block)
-            for i in range(BLOCK_N):
-                if n_start + i < intermediate_dim:
-                    val = h_mid_abs[i]
-                    actual_val = h_mid_block[i]
-                    idx = n_start + i
-
-                    # Check if this value is larger than smallest in top-K
-                    min_topk = tl.min(tl.abs(topk_vals))
-                    if val > min_topk:
-                        # Find position of min and replace
-                        # Simple: find first position where |topk_vals| == min_topk
-                        for j in range(k):
-                            if tl.abs(topk_vals[j]) == min_topk:
-                                topk_vals = tl.where(tl.arange(0, k) == j, actual_val.to(tl.float32), topk_vals)
-                                topk_idxs = tl.where(tl.arange(0, k) == j, idx, topk_idxs)
-                                break
-
-        # Store y for this token
-        for h_idx in range(hidden_dim):
-            tl.store(y_ptr + m_idx * stride_y_row + h_idx, y_acc[h_idx].to(tl.float16))
-
-        # Store top-K values and indices
-        for ki in range(k):
-            tl.store(values_ptr + m_idx * stride_val_row + ki, topk_vals[ki].to(tl.float16))
-            tl.store(indices_ptr + m_idx * stride_idx_row + ki, topk_idxs[ki].to(tl.int16))
+    tl.store(grad_hgate_ptr + offsets, grad_h_gate, mask=mask)
+    tl.store(grad_hup_ptr + offsets, grad_h_up, mask=mask)
 
 
 # =============================================================================
-# PyTorch Wrappers
+# PyTorch Wrappers for Triton Kernels
 # =============================================================================
 
-def triton_silu(x: torch.Tensor) -> torch.Tensor:
-    """Apply SiLU activation using Triton kernel."""
-    out = torch.empty_like(x)
-    n_elements = x.numel()
+def triton_silu_mul(h_gate: torch.Tensor, h_up: torch.Tensor) -> torch.Tensor:
+    """Fused SiLU(h_gate) * h_up using Triton. Replaces F.silu + mul."""
+    out = torch.empty_like(h_gate)
+    n_elements = h_gate.numel()
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    _silu_kernel[grid](x, out, n_elements, BLOCK_SIZE)
+    _silu_mul_fwd_kernel[grid](h_gate, h_up, out, n_elements, BLOCK_SIZE)
     return out
 
 
-def triton_swiglu_fused(
-    x: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Compute SwiGLU: SiLU(x @ W_gate.T) * (x @ W_up.T)
-
-    Args:
-        x: Input tensor (batch, seq, hidden_dim) or (batch*seq, hidden_dim)
-        w_gate: Gate weight (intermediate_dim, hidden_dim)
-        w_up: Up weight (intermediate_dim, hidden_dim)
-
-    Returns:
-        h_mid: Intermediate activations (batch*seq, intermediate_dim)
-    """
-    # Reshape to 2D
-    orig_shape = x.shape
-    if x.dim() == 3:
-        x = x.view(-1, x.shape[-1])
-
-    batch_seq, hidden_dim = x.shape
-    intermediate_dim = w_gate.shape[0]
-
-    # Output tensor
-    h_mid = torch.empty(batch_seq, intermediate_dim, device=x.device, dtype=x.dtype)
-
-    # Block sizes
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 64
-
-    # Grid
-    grid = (triton.cdiv(batch_seq, BLOCK_M), triton.cdiv(intermediate_dim, BLOCK_N))
-
-    _swiglu_fused_kernel[grid](
-        x, w_gate, w_up, h_mid,
-        batch_seq, hidden_dim, intermediate_dim,
-        x.stride(0),
-        w_gate.stride(0), w_gate.stride(1),
-        w_up.stride(0), w_up.stride(1),
-        h_mid.stride(0),
-        BLOCK_M, BLOCK_N, BLOCK_K,
+def triton_swiglu_backward(
+    grad_h_mid: torch.Tensor,
+    h_gate: torch.Tensor,
+    h_up: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused backward through SwiGLU using Triton."""
+    grad_h_gate = torch.empty_like(h_gate)
+    grad_h_up = torch.empty_like(h_up)
+    n_elements = h_gate.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    _swiglu_bwd_kernel[grid](
+        grad_h_mid, h_gate, h_up,
+        grad_h_gate, grad_h_up,
+        n_elements, BLOCK_SIZE,
     )
+    return grad_h_gate, grad_h_up
 
-    return h_mid
 
+# =============================================================================
+# Core FlashFFN Autograd Function
+# =============================================================================
 
 class FlashFFNFunction(torch.autograd.Function):
     """
-    Custom autograd function for FlashFFN.
+    Custom autograd function for FlashFFN with activation compression.
 
-    Forward: Computes FFN output while storing only compressed activations.
-    Backward: Uses compressed activations for gradient computation.
+    Dual-mode forward/backward optimized for both training regimes:
+
+    **Recompute mode** (weights need gradients — full fine-tuning):
+      Forward:  cuBLAS matmuls + fused Triton SiLU*mul + top-K compression
+      Backward: sparse h_mid for grad_w_down (approximate), recompute
+                h_gate/h_up for exact grad_x/grad_w_gate/grad_w_up
+      Saves: x + compressed top-K  (~22 MB/layer at TinyLlama scale)
+
+    **Activations mode** (weights frozen — LoRA / adapter training):
+      Forward:  cuBLAS matmuls + fused Triton SiLU*mul (NO top-K overhead)
+      Backward: direct backward using saved h_gate/h_up (no recomputation)
+      Saves: h_gate + h_up  (~46 MB/layer — 33% less than standard autograd
+             which saves h_gate + h_act + h_up = ~69 MB/layer)
+
+    Mode is selected automatically based on weight requires_grad status.
     """
 
     @staticmethod
@@ -453,170 +161,137 @@ class FlashFFNFunction(torch.autograd.Function):
         w_down: torch.Tensor,
         k_fraction: float = 0.3,
     ) -> torch.Tensor:
-        """
-        Forward pass with activation compression.
-
-        For memory efficiency, we use a hybrid approach:
-        1. Compute in tiles using standard PyTorch (for correctness)
-        2. Extract top-K per token
-        3. Only store compressed representation
-
-        A fully fused Triton kernel would be more efficient but harder to debug.
-        """
-        # Save original shape
         orig_shape = x.shape
         batch_seq = x.shape[0] * x.shape[1] if x.dim() == 3 else x.shape[0]
         hidden_dim = x.shape[-1]
         intermediate_dim = w_gate.shape[0]
 
-        # Flatten to 2D
-        x_2d = x.view(batch_seq, hidden_dim)
+        x_2d = x.reshape(batch_seq, hidden_dim)
 
-        # Compute full output (we need exact output, no approximation here)
-        # But we do this in tiles to reduce peak memory
-        TILE_SIZE = 256  # tokens per tile
+        # --- Full forward: cuBLAS matmuls + fused Triton SiLU*mul ---
+        h_gate = F.linear(x_2d, w_gate)              # (N, D) cuBLAS
+        h_up = F.linear(x_2d, w_up)                  # (N, D) cuBLAS
+        h_mid = triton_silu_mul(h_gate, h_up)         # (N, D) fused Triton
 
-        y = torch.zeros(batch_seq, hidden_dim, device=x.device, dtype=x.dtype)
+        y = F.linear(h_mid, w_down)                   # (N, H) cuBLAS
 
-        # Compute k (number of values to keep per token)
-        k = max(1, int(intermediate_dim * k_fraction))
+        # --- Choose save mode based on weight requires_grad ---
+        weights_need_grad = (
+            w_gate.requires_grad or w_up.requires_grad or w_down.requires_grad
+        )
 
-        # Storage for compressed activations
-        all_values = torch.empty(batch_seq, k, device=x.device, dtype=x.dtype)
-        all_indices = torch.empty(batch_seq, k, device=x.device, dtype=torch.int16)
-
-        # Process in tiles
-        for tile_start in range(0, batch_seq, TILE_SIZE):
-            tile_end = min(tile_start + TILE_SIZE, batch_seq)
-            x_tile = x_2d[tile_start:tile_end]  # (tile_size, hidden_dim)
-
-            # Compute SwiGLU for this tile
-            h_gate = F.linear(x_tile, w_gate)  # (tile_size, intermediate_dim)
-            h_up = F.linear(x_tile, w_up)
-            h_act = F.silu(h_gate)
-            h_mid = h_act * h_up
-
-            # Compute output for this tile
-            y_tile = F.linear(h_mid, w_down)
-            y[tile_start:tile_end] = y_tile
-
-            # Extract top-K for this tile
-            abs_h_mid = h_mid.abs()
-            _, top_indices = torch.topk(abs_h_mid, k, dim=-1, sorted=False)
+        if weights_need_grad:
+            # RECOMPUTE MODE: save x + compressed top-K for backward
+            del h_gate, h_up
+            k = max(1, int(intermediate_dim * k_fraction))
+            _, top_indices = torch.topk(h_mid.abs(), k, dim=-1, sorted=False)
             top_values = torch.gather(h_mid, dim=-1, index=top_indices)
+            all_indices = top_indices.to(torch.int16)
+            del h_mid, top_indices
+            ctx.save_for_backward(x, w_gate, w_up, w_down, top_values, all_indices)
+            ctx.save_mode = 'recompute'
+            ctx.k = k
+            ctx.intermediate_dim = intermediate_dim
+        else:
+            # ACTIVATIONS MODE: save h_gate/h_up directly (fast backward)
+            del h_mid
+            ctx.save_for_backward(h_gate, h_up, w_gate, w_up, w_down)
+            ctx.save_mode = 'activations'
 
-            all_values[tile_start:tile_end] = top_values
-            all_indices[tile_start:tile_end] = top_indices.to(torch.int16)
-
-            # h_gate, h_up, h_act, h_mid are now out of scope and can be freed
+        ctx.orig_shape = orig_shape
 
         # Reshape output
         if len(orig_shape) == 3:
             y = y.view(orig_shape[0], orig_shape[1], hidden_dim)
 
-        # Save for backward - only compressed representation + weights + input
-        # Note: We need x for full backward. This is the main trade-off.
-        # Option 1: Save x (memory cost but exact gradients)
-        # Option 2: Don't save x, only compute grad_w_down (approximate)
-        # We choose Option 1 for correctness, but could optimize later
-        ctx.save_for_backward(x, w_gate, w_up, w_down, all_values, all_indices)
-        ctx.k = k
-        ctx.intermediate_dim = intermediate_dim
-
         return y
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """
-        Backward pass using compressed activations.
+        orig_shape = ctx.orig_shape
+        batch_seq = orig_shape[0] * orig_shape[1] if len(orig_shape) == 3 else orig_shape[0]
+        hidden_dim = orig_shape[-1]
 
-        For grad_w_down, we use the compressed h_mid (sparse reconstruction).
-        For grad_x, grad_w_gate, grad_w_up, we need to recompute h_mid
-        (gradient checkpointing style) since we didn't save full activations.
-        """
-        x, w_gate, w_up, w_down, values, indices = ctx.saved_tensors
-        k = ctx.k
-        intermediate_dim = ctx.intermediate_dim
+        grad_output_2d = grad_output.reshape(batch_seq, hidden_dim)
 
-        # Get shapes
-        orig_shape = x.shape
-        batch_seq = x.shape[0] * x.shape[1] if x.dim() == 3 else x.shape[0]
-        hidden_dim = x.shape[-1]
+        if ctx.save_mode == 'activations':
+            # --- ACTIVATIONS MODE: fast backward, no recomputation ---
+            h_gate, h_up, w_gate, w_up, w_down = ctx.saved_tensors
 
-        # Flatten
-        x_2d = x.view(batch_seq, hidden_dim)
-        grad_output_2d = grad_output.view(batch_seq, hidden_dim)
+            # grad through output projection
+            grad_h_mid = grad_output_2d @ w_down               # (N, D) cuBLAS
 
-        # Initialize gradients
-        grad_x = torch.zeros_like(x_2d)
-        grad_w_gate = torch.zeros_like(w_gate)
-        grad_w_up = torch.zeros_like(w_up)
-        grad_w_down = torch.zeros_like(w_down)
+            # Fused backward through SiLU-mul using saved h_gate, h_up
+            grad_h_gate, grad_h_up = triton_swiglu_backward(grad_h_mid, h_gate, h_up)
+            del h_gate, h_up, grad_h_mid
 
-        # For grad_w_down, we can use the sparse h_mid
-        # grad_w_down = grad_output.T @ h_mid
-        # Reconstruct sparse h_mid
-        h_mid_sparse = torch.zeros(batch_seq, intermediate_dim, device=x.device, dtype=x.dtype)
-        h_mid_sparse.scatter_(dim=-1, index=indices.long(), src=values)
+            # Input gradient only (weights are frozen)
+            grad_x = grad_h_gate @ w_gate + grad_h_up @ w_up   # (N, H)
+            del grad_h_gate, grad_h_up
 
-        # grad_w_down = grad_output.T @ h_mid_sparse
-        grad_w_down = grad_output_2d.t() @ h_mid_sparse
+            if len(orig_shape) == 3:
+                grad_x = grad_x.view(orig_shape)
 
-        # For other gradients, we need to recompute in tiles (gradient checkpointing)
-        TILE_SIZE = 256
+            return grad_x, None, None, None, None
 
-        for tile_start in range(0, batch_seq, TILE_SIZE):
-            tile_end = min(tile_start + TILE_SIZE, batch_seq)
-            x_tile = x_2d[tile_start:tile_end]
-            grad_out_tile = grad_output_2d[tile_start:tile_end]
+        else:
+            # --- RECOMPUTE MODE: full gradient computation ---
+            x, w_gate, w_up, w_down, values, indices = ctx.saved_tensors
+            k = ctx.k
+            intermediate_dim = ctx.intermediate_dim
 
-            # Recompute forward for this tile
-            h_gate = F.linear(x_tile, w_gate)
-            h_up = F.linear(x_tile, w_up)
-            h_act = F.silu(h_gate)
-            h_mid = h_act * h_up
+            x_2d = x.reshape(batch_seq, hidden_dim)
 
-            # Backward through output projection
-            # y = h_mid @ w_down.T
-            # grad_h_mid = grad_out @ w_down
-            grad_h_mid = grad_out_tile @ w_down
+            # Check which inputs need gradients
+            need_x_grad = ctx.needs_input_grad[0]
+            need_wgate_grad = ctx.needs_input_grad[1]
+            need_wup_grad = ctx.needs_input_grad[2]
+            need_wdown_grad = ctx.needs_input_grad[3]
 
-            # Backward through h_mid = h_act * h_up
-            # grad_h_act = grad_h_mid * h_up
-            # grad_h_up = grad_h_mid * h_act
-            grad_h_act = grad_h_mid * h_up
-            grad_h_up = grad_h_mid * h_act
+            # grad_w_down via sparse h_mid reconstruction
+            if need_wdown_grad:
+                h_mid_sparse = torch.zeros(
+                    batch_seq, intermediate_dim, device=x.device, dtype=x.dtype
+                )
+                h_mid_sparse.scatter_(dim=-1, index=indices.long(), src=values)
+                grad_w_down = grad_output_2d.t() @ h_mid_sparse
+                del h_mid_sparse
+            else:
+                grad_w_down = None
 
-            # Backward through SiLU
-            # silu(x) = x * sigmoid(x)
-            # dsilu/dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
-            #          = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-            sigmoid_h_gate = torch.sigmoid(h_gate)
-            grad_silu = sigmoid_h_gate * (1 + h_gate * (1 - sigmoid_h_gate))
-            grad_h_gate = grad_h_act * grad_silu
+            # Exact gradients via forward recomputation
+            if need_x_grad or need_wgate_grad or need_wup_grad:
+                h_gate = F.linear(x_2d, w_gate)
+                h_up = F.linear(x_2d, w_up)
+                grad_h_mid = grad_output_2d @ w_down
 
-            # Backward through linear projections
-            # h_gate = x @ w_gate.T
-            # grad_x_gate = grad_h_gate @ w_gate
-            # grad_w_gate += grad_h_gate.T @ x
-            grad_x_gate = grad_h_gate @ w_gate
-            grad_w_gate += grad_h_gate.t() @ x_tile
+                grad_h_gate, grad_h_up = triton_swiglu_backward(
+                    grad_h_mid, h_gate, h_up
+                )
+                del h_gate, h_up, grad_h_mid
 
-            # h_up = x @ w_up.T
-            # grad_x_up = grad_h_up @ w_up
-            # grad_w_up += grad_h_up.T @ x
-            grad_x_up = grad_h_up @ w_up
-            grad_w_up += grad_h_up.t() @ x_tile
+                grad_w_gate = grad_h_gate.t() @ x_2d if need_wgate_grad else None
+                grad_w_up = grad_h_up.t() @ x_2d if need_wup_grad else None
 
-            # Total grad_x
-            grad_x[tile_start:tile_end] = grad_x_gate + grad_x_up
+                if need_x_grad:
+                    grad_x = grad_h_gate @ w_gate + grad_h_up @ w_up
+                else:
+                    grad_x = None
+                del grad_h_gate, grad_h_up
+            else:
+                grad_x = None
+                grad_w_gate = None
+                grad_w_up = None
 
-        # Reshape grad_x
-        if len(orig_shape) == 3:
-            grad_x = grad_x.view(orig_shape)
+            if need_x_grad and len(orig_shape) == 3:
+                grad_x = grad_x.view(orig_shape)
 
-        return grad_x, grad_w_gate, grad_w_up, grad_w_down, None
+            return grad_x, grad_w_gate, grad_w_up, grad_w_down, None
 
+
+# =============================================================================
+# Module Wrappers
+# =============================================================================
 
 class FlashFFN(nn.Module):
     """
@@ -676,6 +351,126 @@ class StandardFFN(nn.Module):
         h_mid = h_act * h_up
         y = self.down_proj(h_mid)
         return y
+
+
+class FlashFFNNoInputSaveFunction(torch.autograd.Function):
+    """
+    FlashFFN variant that doesn't save input x for backward.
+
+    This is for use with model-level gradient checkpointing where x will be
+    recomputed from the previous layer. Achieves maximum memory savings.
+
+    WARNING: Only use this with gradient checkpointing enabled at model level.
+    Without recomputing x, grad_w_gate and grad_w_up will be zeros!
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        w_gate: torch.Tensor,
+        w_up: torch.Tensor,
+        w_down: torch.Tensor,
+        k_fraction: float = 0.3,
+    ) -> torch.Tensor:
+        orig_shape = x.shape
+        batch_seq = x.shape[0] * x.shape[1] if x.dim() == 3 else x.shape[0]
+        hidden_dim = x.shape[-1]
+        intermediate_dim = w_gate.shape[0]
+
+        x_2d = x.reshape(batch_seq, hidden_dim)
+
+        # Full forward: cuBLAS + fused Triton (no tiling)
+        h_gate = F.linear(x_2d, w_gate)
+        h_up = F.linear(x_2d, w_up)
+        h_mid = triton_silu_mul(h_gate, h_up)
+        del h_gate, h_up
+
+        y = F.linear(h_mid, w_down)
+
+        # Compress
+        k = max(1, int(intermediate_dim * k_fraction))
+        _, top_indices = torch.topk(h_mid.abs(), k, dim=-1, sorted=False)
+        top_values = torch.gather(h_mid, dim=-1, index=top_indices)
+        all_indices = top_indices.to(torch.int16)
+        del h_mid, top_indices
+
+        if len(orig_shape) == 3:
+            y = y.view(orig_shape[0], orig_shape[1], hidden_dim)
+
+        # Save ONLY compressed representation + weights (NOT x!)
+        ctx.save_for_backward(w_gate, w_up, w_down, top_values, all_indices)
+        ctx.k = k
+        ctx.intermediate_dim = intermediate_dim
+        ctx.orig_shape = orig_shape
+
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward pass using ONLY compressed activations.
+
+        NOTE: This only computes grad_w_down accurately.
+        grad_x, grad_w_gate, grad_w_up are zeros (rely on model-level checkpointing).
+        """
+        w_gate, w_up, w_down, values, indices = ctx.saved_tensors
+        k = ctx.k
+        intermediate_dim = ctx.intermediate_dim
+        orig_shape = ctx.orig_shape
+
+        batch_seq = orig_shape[0] * orig_shape[1] if len(orig_shape) == 3 else orig_shape[0]
+        hidden_dim = orig_shape[-1]
+
+        grad_output_2d = grad_output.view(batch_seq, hidden_dim)
+
+        # Reconstruct sparse h_mid
+        h_mid_sparse = torch.zeros(batch_seq, intermediate_dim, device=values.device, dtype=values.dtype)
+        h_mid_sparse.scatter_(dim=-1, index=indices.long(), src=values)
+
+        # grad_w_down = grad_output.T @ h_mid_sparse (accurate using sparse h_mid)
+        grad_w_down = grad_output_2d.t() @ h_mid_sparse
+
+        # Return zeros for other gradients (model-level checkpointing will recompute)
+        grad_w_gate = torch.zeros_like(w_gate)
+        grad_w_up = torch.zeros_like(w_up)
+        grad_x = torch.zeros(orig_shape, device=grad_output.device, dtype=grad_output.dtype)
+
+        return grad_x, grad_w_gate, grad_w_up, grad_w_down, None
+
+
+class FlashFFNUltraLight(nn.Module):
+    """
+    Ultra memory-efficient FlashFFN that only saves compressed h_mid.
+
+    Must be used with model-level gradient checkpointing!
+    Achieves ~90% activation memory reduction.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        intermediate_dim: int,
+        k_fraction: float = 0.3,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.intermediate_dim = intermediate_dim
+        self.k_fraction = k_fraction
+
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return FlashFFNNoInputSaveFunction.apply(
+            x,
+            self.gate_proj.weight,
+            self.up_proj.weight,
+            self.down_proj.weight,
+            self.k_fraction,
+        )
 
 
 # =============================================================================
@@ -846,156 +641,6 @@ def test_memory_savings():
     print(f"  Total peak savings: {total_savings:.1f}%")
 
     return fwd_savings > 0 and total_savings > 0
-
-
-class FlashFFNNoInputSaveFunction(torch.autograd.Function):
-    """
-    FlashFFN variant that doesn't save input x for backward.
-
-    This is for use with model-level gradient checkpointing where x will be
-    recomputed from the previous layer. Achieves maximum memory savings.
-
-    WARNING: Only use this with gradient checkpointing enabled at model level.
-    Without recomputing x, grad_w_gate and grad_w_up will be zeros!
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        w_gate: torch.Tensor,
-        w_up: torch.Tensor,
-        w_down: torch.Tensor,
-        k_fraction: float = 0.3,
-    ) -> torch.Tensor:
-        # Save original shape
-        orig_shape = x.shape
-        batch_seq = x.shape[0] * x.shape[1] if x.dim() == 3 else x.shape[0]
-        hidden_dim = x.shape[-1]
-        intermediate_dim = w_gate.shape[0]
-
-        # Flatten to 2D
-        x_2d = x.view(batch_seq, hidden_dim)
-
-        # Process in tiles
-        TILE_SIZE = 256
-        y = torch.zeros(batch_seq, hidden_dim, device=x.device, dtype=x.dtype)
-        k = max(1, int(intermediate_dim * k_fraction))
-
-        all_values = torch.empty(batch_seq, k, device=x.device, dtype=x.dtype)
-        all_indices = torch.empty(batch_seq, k, device=x.device, dtype=torch.int16)
-
-        for tile_start in range(0, batch_seq, TILE_SIZE):
-            tile_end = min(tile_start + TILE_SIZE, batch_seq)
-            x_tile = x_2d[tile_start:tile_end]
-
-            h_gate = F.linear(x_tile, w_gate)
-            h_up = F.linear(x_tile, w_up)
-            h_act = F.silu(h_gate)
-            h_mid = h_act * h_up
-
-            y_tile = F.linear(h_mid, w_down)
-            y[tile_start:tile_end] = y_tile
-
-            abs_h_mid = h_mid.abs()
-            _, top_indices = torch.topk(abs_h_mid, k, dim=-1, sorted=False)
-            top_values = torch.gather(h_mid, dim=-1, index=top_indices)
-
-            all_values[tile_start:tile_end] = top_values
-            all_indices[tile_start:tile_end] = top_indices.to(torch.int16)
-
-        if len(orig_shape) == 3:
-            y = y.view(orig_shape[0], orig_shape[1], hidden_dim)
-
-        # Save ONLY compressed representation + weights (NOT x!)
-        ctx.save_for_backward(w_gate, w_up, w_down, all_values, all_indices)
-        ctx.k = k
-        ctx.intermediate_dim = intermediate_dim
-        ctx.orig_shape = orig_shape
-
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """
-        Backward pass using ONLY compressed activations.
-
-        NOTE: This only computes grad_w_down accurately.
-        grad_x, grad_w_gate, grad_w_up are computed approximately using
-        the sparse h_mid reconstruction.
-        """
-        w_gate, w_up, w_down, values, indices = ctx.saved_tensors
-        k = ctx.k
-        intermediate_dim = ctx.intermediate_dim
-        orig_shape = ctx.orig_shape
-
-        batch_seq = orig_shape[0] * orig_shape[1] if len(orig_shape) == 3 else orig_shape[0]
-        hidden_dim = orig_shape[-1]
-
-        grad_output_2d = grad_output.view(batch_seq, hidden_dim)
-
-        # Reconstruct sparse h_mid
-        h_mid_sparse = torch.zeros(batch_seq, intermediate_dim, device=values.device, dtype=values.dtype)
-        h_mid_sparse.scatter_(dim=-1, index=indices.long(), src=values)
-
-        # grad_w_down = grad_output.T @ h_mid_sparse (accurate using sparse h_mid)
-        grad_w_down = grad_output_2d.t() @ h_mid_sparse
-
-        # grad_h_mid = grad_output @ w_down
-        grad_h_mid = grad_output_2d @ w_down
-
-        # Approximate grad_x using sparse backward
-        # This is an approximation since we don't have full h_mid
-        # For a fully correct implementation, we'd need x (or use model-level checkpointing)
-
-        # We can compute an approximate grad_x by backprop through sparse h_mid
-        # But without x, we can't compute grad_w_gate and grad_w_up
-
-        # Return zeros for w_gate and w_up gradients (model-level checkpointing will recompute)
-        grad_w_gate = torch.zeros_like(w_gate)
-        grad_w_up = torch.zeros_like(w_up)
-
-        # For grad_x, we use an approximation: backprop through the sparse path
-        # This is equivalent to assuming only the top-K values contribute
-        # grad_x = grad_h_mid @ (W_gate + W_up) approximately
-        # But this is complex with SwiGLU, so we just return zeros and rely on checkpointing
-        grad_x = torch.zeros(orig_shape, device=grad_output.device, dtype=grad_output.dtype)
-
-        return grad_x, grad_w_gate, grad_w_up, grad_w_down, None
-
-
-class FlashFFNUltraLight(nn.Module):
-    """
-    Ultra memory-efficient FlashFFN that only saves compressed h_mid.
-
-    Must be used with model-level gradient checkpointing!
-    Achieves ~90% activation memory reduction.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        intermediate_dim: int,
-        k_fraction: float = 0.3,
-        bias: bool = False,
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.intermediate_dim = intermediate_dim
-        self.k_fraction = k_fraction
-
-        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
-        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
-        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return FlashFFNNoInputSaveFunction.apply(
-            x,
-            self.gate_proj.weight,
-            self.up_proj.weight,
-            self.down_proj.weight,
-            self.k_fraction,
-        )
 
 
 def test_memory_detailed():
