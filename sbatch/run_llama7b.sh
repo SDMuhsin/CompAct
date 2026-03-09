@@ -238,7 +238,10 @@ get_job_resources() {
 
 get_time_limit() {
     # Returns SLURM time string.
-    # LLaMA-7B is ~6x TinyLlama compute. Times scaled accordingly.
+    # Mo5 (5 seeds) on full H100 (80GB).
+    # LLaMA-7B is ~6x bigger than TinyLlama but runs on full GPU (~3x more
+    # compute than MIG 3g.40gb). Net: ~2x TinyLlama's calibrated estimates.
+    # Same effective batch size (64) via batch=4, grad_accum=16.
     local technique=$1
     local task=$2
     local minutes=0
@@ -247,35 +250,38 @@ get_time_limit() {
 
     if is_wikitext_task "$task"; then
         if [[ "$base_tech" == "base" ]]; then
-            minutes=720     # Full FT, 1 epoch, 5 seeds
+            minutes=960
         else
-            minutes=360     # PEFT, 1 epoch, 5 seeds
+            minutes=480
         fi
     elif [[ "$base_tech" == "base" ]]; then
         # Full FT: 3 epochs, 5 seeds
         case $task in
-            mrpc|rte|stsb|cb)  minutes=360   ;;
-            cola)              minutes=540   ;;
-            boolq)             minutes=1080  ;;
-            sst2)              minutes=2160  ;;
-            qnli)              minutes=3240  ;;
+            cb)                minutes=60    ;;
+            rte)               minutes=240   ;;
+            mrpc)              minutes=360   ;;
+            stsb)              minutes=600   ;;
+            cola)              minutes=720   ;;
+            boolq)             minutes=960   ;;
+            sst2)              minutes=5760  ;;
+            qnli)              minutes=8640  ;;
         esac
     else
-        # PEFT: 10 epochs, 5 seeds
+        # PEFT: 10 epochs, 5 seeds (attention-only, faster backward)
         case $task in
-            rte|cb)        minutes=720   ;;
-            mrpc|stsb)     minutes=900   ;;
+            cb)            minutes=60    ;;
+            rte)           minutes=480   ;;
+            mrpc)          minutes=720   ;;
+            stsb)          minutes=1080  ;;
             cola)          minutes=1440  ;;
-            boolq)         minutes=3600  ;;
-            sst2)          minutes=5400  ;;
-            qnli)          minutes=7200  ;;
+            boolq)         minutes=1680  ;;
+            sst2)          minutes=10080 ;;
+            qnli)          minutes=10080 ;;
         esac
     fi
 
-    # FlashFFN recompute mode adds ~50% overhead for top-K
-    if is_flash_technique "$technique" && [[ "$base_tech" != "base" ]]; then
-        minutes=$((minutes * 3 / 2))
-    fi
+    # FlashFFN activations mode has minimal overhead (no top-K)
+    # No time adjustment needed for LLaMA-7B flash techniques
 
     # Format as D-HH:MM:SS or H:MM:SS
     local hours=$((minutes / 60))

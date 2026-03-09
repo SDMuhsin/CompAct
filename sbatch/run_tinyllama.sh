@@ -227,7 +227,11 @@ get_epochs() {
 
 get_time_limit() {
     # Returns SLURM time string.
-    # Mo5 (5 seeds): estimates based on TinyLlama (1.1B) throughput.
+    # Mo5 (5 seeds) on MIG h100_3g.40gb slice.
+    # Calibrated from CoLA Full FT empirical run: ~360 min for 2010 optimizer steps
+    # → ~10.8s/step. Scaled proportionally by dataset size and epochs.
+    # Dataset sizes: CB=250, RTE=2490, MRPC=3668, STSB=5749, CoLA=8551,
+    #   BoolQ=9427, SST2=67349, QNLI=104743, WT2≈36k chunks (seq=512,batch=8)
     local technique=$1
     local task=$2
     local minutes=0
@@ -235,30 +239,35 @@ get_time_limit() {
     local base_tech=$(get_base_technique "$technique")
 
     if is_wikitext_task "$task"; then
-        # WikiText-2: 1 epoch, 5 seeds, seq=512
+        # WikiText-2: 1 epoch, 5 seeds, seq=512, batch=8
         if [[ "$base_tech" == "base" ]]; then
-            minutes=120     # Full FT, larger memory
+            minutes=480
         else
-            minutes=60      # PEFT, frozen backbone
+            minutes=240
         fi
     elif [[ "$base_tech" == "base" ]]; then
-        # Full FT: 3 epochs, 5 seeds
+        # Full FT: 3 epochs, 5 seeds, ~10.8s/optimizer_step
         case $task in
-            mrpc|rte|stsb|cb)  minutes=60   ;;
-            cola)              minutes=90   ;;
-            boolq)             minutes=180  ;;
-            sst2)              minutes=360  ;;
-            qnli)              minutes=540  ;;
+            cb)                minutes=30    ;;
+            rte)               minutes=120   ;;
+            mrpc)              minutes=180   ;;
+            stsb)              minutes=300   ;;
+            cola)              minutes=360   ;;
+            boolq)             minutes=480   ;;
+            sst2)              minutes=2880  ;;
+            qnli)              minutes=4320  ;;
         esac
     else
-        # PEFT: 10 epochs, 5 seeds
+        # PEFT: 10 epochs, 5 seeds, ~7s/optimizer_step (less backward compute)
         case $task in
-            rte|cb)        minutes=120  ;;
-            mrpc|stsb)     minutes=150  ;;
-            cola)          minutes=240  ;;
-            boolq)         minutes=600  ;;
-            sst2)          minutes=900  ;;
-            qnli)          minutes=1200 ;;
+            cb)            minutes=30    ;;
+            rte)           minutes=240   ;;
+            mrpc)          minutes=360   ;;
+            stsb)          minutes=540   ;;
+            cola)          minutes=720   ;;
+            boolq)         minutes=840   ;;
+            sst2)          minutes=5760  ;;
+            qnli)          minutes=8640  ;;
         esac
     fi
 
