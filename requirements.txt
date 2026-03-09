@@ -14,6 +14,6 @@ lion-pytorch
 adapter-transformers
 peft
 galore-torch
-huggingface_hub
+huggingface_hub[hf_xet]
 sentencepiece
 scikit-learn
