@@ -57,20 +57,20 @@ DTYPE="bfloat16"
 # Techniques to benchmark (comment/uncomment as needed)
 techniques=(
     "base"
-    #"lora"
-    #"dora"
-    #"adalora"
-    #"dylora"
-    #"vera"
-    #"fourierft"
+    "lora"
+    "dora"
+    "adalora"
+    "dylora"
+    "vera"
+    "fourierft"
     #"spectral"
     # FlashFFN variants (only for methods with effective-weight paths)
-    #"base_flash"
-    #"lora_flash"
-    #"dora_flash"
-    #"adalora_flash"
-    #"dylora_flash"
-    #"vera_flash"
+    "base_flash"
+    "lora_flash"
+    "dora_flash"
+    "adalora_flash"
+    "dylora_flash"
+    "vera_flash"
 )
 
 # Tasks to evaluate
