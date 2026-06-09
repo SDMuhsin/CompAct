@@ -4,3 +4,4 @@ env
 llmdocs
 
 **pycache**
+logs

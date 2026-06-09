@@ -31,7 +31,9 @@ import math
 import operator
 import os
 import random
+import shutil
 import statistics
+import sys
 import time
 from functools import reduce
 from pathlib import Path
@@ -782,6 +784,21 @@ def parse_args():
 
     # Results CSV
     parser.add_argument("--results_csv", type=str, default=DEFAULT_RESULTS_FILE, help="Path to the results CSV file (default: ./results/mo53_glue.csv).")
+
+    # --- Seed-split execution (transparent Mo5 sharding for large tasks) ---
+    # These exist so an sbatch script can run the 5 Mo5 seeds as separate jobs
+    # (e.g. for SST-2/QNLI which would otherwise be multi-day monoliths) without
+    # changing the reported output: workers write per-seed partials, and a final
+    # aggregation pass collapses them into the exact same single Mo5 CSV row.
+    parser.add_argument("--seeds", type=str, default=None,
+                        help="Comma-separated subset of seeds to run this invocation (e.g. '41'). "
+                             "Default: all of %s (unchanged Mo5 behaviour)." % SEEDS)
+    parser.add_argument("--partial_dir", type=str, default=None,
+                        help="Worker mode: write each seed's result as a JSON partial into this "
+                             "directory and SKIP writing the Mo5 CSV row. An --aggregate pass combines them.")
+    parser.add_argument("--aggregate", action="store_true",
+                        help="Aggregation mode: do NOT train. Read all per-seed partials from --partial_dir, "
+                             "compute the Mo5 median row, write it to the results CSV, and clean up the partials.")
 
     args = parser.parse_args()
 
@@ -1706,28 +1723,110 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     }
 
 ###############################################################################
-#                                  entry-point                                #
+#                          Mo5 aggregation helpers                            #
 ###############################################################################
-def main():
-    args = parse_args()
-    
-    training_start_time = time.time()
-    all_results: List[Dict] = []
-    for idx, seed in enumerate(SEEDS):
-        print("=" * 80, flush=True)
-        print(f"Starting run {idx + 1}/{len(SEEDS)} with seed {seed}", flush=True)
-        print("=" * 80, flush=True)
-        res = run_single_seed(args, seed)
-        all_results.append(res)
-    
-    total_training_time_sec = time.time() - training_start_time
+# Memory / step-time stats are carried verbatim from each per-seed run. The Mo5
+# row takes them from the lowest-numbered seed (historically seed 41, which ran
+# first), so a split run and a single-process run yield byte-identical rows.
+_PARTIAL_STAT_KEYS = [
+    "param_mem_mib", "opt_mem_mib", "runtime_mem_mib", "peak_mem_mib",
+    "theoretical_mem_mib", "avg_step_time", "std_step_time",
+]
 
-    # --- Process and Save Results ---
-    first_res = all_results[0]
+
+def _resolve_seeds(args) -> List[int]:
+    """Seeds this invocation should run. Defaults to the full Mo5 set."""
+    if getattr(args, "seeds", None):
+        return [int(s) for s in str(args.seeds).split(",") if s.strip() != ""]
+    return list(SEEDS)
+
+
+def _nan_to_none(v):
+    return None if (isinstance(v, float) and math.isnan(v)) else v
+
+
+def _write_partial_result(partial_dir: str, seed: int, res: Dict, single_seed_time: float) -> None:
+    """Worker mode: persist one seed's result as an atomic JSON partial."""
+    os.makedirs(partial_dir, exist_ok=True)
+    payload = {
+        "seed": int(seed),
+        "best_metric_dict": {k: _nan_to_none(v) for k, v in res["best_metric_dict"].items()},
+        "single_seed_train_time_sec": single_seed_time,
+    }
+    for k in _PARTIAL_STAT_KEYS:
+        payload[k] = _nan_to_none(res.get(k, np.nan))
+    final = os.path.join(partial_dir, f"seed_{seed}.json")
+    tmp = final + f".tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, final)
+    logger.info(f"[seed {seed}] Wrote per-seed partial -> {final}")
+
+
+def _read_partial_results(partial_dir: str) -> List[Dict]:
+    """Aggregation mode: load all per-seed partials back into result dicts."""
+    out: List[Dict] = []
+    if not os.path.isdir(partial_dir):
+        return out
+    for fn in sorted(os.listdir(partial_dir)):
+        if not (fn.startswith("seed_") and fn.endswith(".json")):
+            continue
+        with open(os.path.join(partial_dir, fn)) as f:
+            p = json.load(f)
+        rec = {
+            "seed": int(p["seed"]),
+            "best_metric_dict": {k: (np.nan if v is None else v)
+                                 for k, v in p.get("best_metric_dict", {}).items()},
+            "single_seed_train_time_sec": p.get("single_seed_train_time_sec", 0.0) or 0.0,
+        }
+        for k in _PARTIAL_STAT_KEYS:
+            v = p.get(k, np.nan)
+            rec[k] = np.nan if v is None else v
+        out.append(rec)
+    return out
+
+
+def write_result_row(results_file: str, all_columns: List[str], comb_cols: List[str],
+                     result_row: Dict) -> bool:
+    """Hardened, atomic, lock-protected upsert of one row into the results CSV."""
+    lock_file = results_file + ".lock"
+    os.makedirs(os.path.dirname(os.path.abspath(results_file)), exist_ok=True)
+    lock = FileLock(lock_file, timeout=300)
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            with lock:
+                logger.info(f"Acquired lock on {lock_file} (attempt {attempt + 1}).")
+                df_results = _load_results_df(results_file, all_columns)
+                df_results = _upsert_result(df_results, comb_cols, result_row)
+                # Atomic write: write to temp file then rename
+                tmp_file = results_file + f".tmp.{os.getpid()}"
+                df_results.to_csv(tmp_file, index=False)
+                os.replace(tmp_file, results_file)
+                logger.info(f"Released lock. Logged Mo5 median results to {results_file}")
+            return True
+        except Timeout:
+            wait = 2 ** attempt + random.uniform(0, 1)
+            logger.warning(f"Lock timeout on attempt {attempt + 1}/{max_retries}. Retrying in {wait:.1f}s...")
+            time.sleep(wait)
+    logger.error(f"Failed to acquire lock on {lock_file} after {max_retries} attempts. Results NOT saved.")
+    return False
+
+
+def build_result_row(args, per_seed_results: List[Dict], total_training_time_sec: float,
+                     seeds_used: List[int]):
+    """Build (all_columns, comb_cols, result_row) for one Mo5 CSV row.
+
+    Task metrics are the median across `per_seed_results`; memory / step-time
+    columns come from the lowest seed (matches the historical first-seed
+    behaviour). Output is identical whether the seeds ran in one process or were
+    split across jobs and recombined here.
+    """
+    first_res = min(per_seed_results, key=lambda r: r["seed"])
     metric_keys = ["accuracy", "f1", "matthews_correlation", "pearson", "spearmanr", "perplexity"]
     median_metrics = {}
     for k in metric_keys:
-        vals = [r["best_metric_dict"].get(k, np.nan) for r in all_results]
+        vals = [r["best_metric_dict"].get(k, np.nan) for r in per_seed_results]
         vals = [v for v in vals if not (isinstance(v, float) and math.isnan(v))]
         median_metrics[k] = statistics.median(vals) if vals else np.nan
 
@@ -1819,33 +1918,68 @@ def main():
         "theoretical_mem_mib": round(first_res["theoretical_mem_mib"], 2),
         "avg_step_time": round(first_res["avg_step_time"], 4) if first_res["avg_step_time"] is not np.nan else np.nan,
         "std_step_time": round(first_res["std_step_time"], 4) if first_res["std_step_time"] is not np.nan else np.nan,
-        "seed": ",".join(map(str, SEEDS)),
+        "seed": ",".join(map(str, seeds_used)),
     }
-    # --- Hardened locking for 100s of concurrent SLURM jobs ---
-    results_file = args.results_csv
-    lock_file = results_file + ".lock"
-    os.makedirs(os.path.dirname(os.path.abspath(results_file)), exist_ok=True)
-    lock = FileLock(lock_file, timeout=300)
+    return all_columns, comb_cols, result_row
 
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            with lock:
-                logger.info(f"Acquired lock on {lock_file} (attempt {attempt + 1}).")
-                df_results = _load_results_df(results_file, all_columns)
-                df_results = _upsert_result(df_results, comb_cols, result_row)
-                # Atomic write: write to temp file then rename
-                tmp_file = results_file + f".tmp.{os.getpid()}"
-                df_results.to_csv(tmp_file, index=False)
-                os.replace(tmp_file, results_file)
-                logger.info(f"Released lock. Logged Mo5 median results to {results_file}")
-            break
-        except Timeout:
-            wait = 2 ** attempt + random.uniform(0, 1)
-            logger.warning(f"Lock timeout on attempt {attempt + 1}/{max_retries}. Retrying in {wait:.1f}s...")
-            time.sleep(wait)
-    else:
-        logger.error(f"Failed to acquire lock on {lock_file} after {max_retries} attempts. Results NOT saved.")
+
+###############################################################################
+#                                  entry-point                                #
+###############################################################################
+def main():
+    args = parse_args()
+
+    # ---- Aggregation mode: recombine per-seed partials into one Mo5 row ----
+    if args.aggregate:
+        if not args.partial_dir:
+            raise ValueError("--aggregate requires --partial_dir")
+        per_seed_results = _read_partial_results(args.partial_dir)
+        if not per_seed_results:
+            logger.error(f"No per-seed partials found in {args.partial_dir}; nothing to "
+                         f"aggregate. CSV not written.")
+            sys.exit(1)
+        seeds_used = sorted(r["seed"] for r in per_seed_results)
+        total_training_time_sec = sum(r["single_seed_train_time_sec"] for r in per_seed_results)
+        if len(seeds_used) < len(SEEDS):
+            logger.warning(f"Aggregating only {len(seeds_used)}/{len(SEEDS)} seeds ({seeds_used}); "
+                           f"some seed jobs may have failed or not finished.")
+        all_columns, comb_cols, result_row = build_result_row(
+            args, per_seed_results, total_training_time_sec, seeds_used)
+        if write_result_row(args.results_csv, all_columns, comb_cols, result_row):
+            logger.info(f"Aggregated Mo{len(seeds_used)} over seeds {seeds_used} -> {args.results_csv}")
+            try:
+                shutil.rmtree(args.partial_dir)
+                logger.info(f"Removed partial dir {args.partial_dir}")
+            except OSError as e:
+                logger.warning(f"Could not remove partial dir {args.partial_dir}: {e}")
+        return
+
+    # ---- Training mode: default (all seeds in-process) or worker (subset) ----
+    seeds = _resolve_seeds(args)
+    worker_mode = bool(args.partial_dir)
+
+    training_start_time = time.time()
+    all_results: List[Dict] = []
+    for idx, seed in enumerate(seeds):
+        print("=" * 80, flush=True)
+        print(f"Starting run {idx + 1}/{len(seeds)} with seed {seed}", flush=True)
+        print("=" * 80, flush=True)
+        seed_start = time.time()
+        res = run_single_seed(args, seed)
+        res["seed"] = seed
+        res["single_seed_train_time_sec"] = time.time() - seed_start
+        all_results.append(res)
+        if worker_mode:
+            _write_partial_result(args.partial_dir, seed, res, res["single_seed_train_time_sec"])
+
+    if worker_mode:
+        logger.info(f"Worker mode complete: wrote partials for seeds {seeds} to {args.partial_dir}. "
+                    f"The aggregation job will write the Mo5 CSV row.")
+        return
+
+    total_training_time_sec = time.time() - training_start_time
+    all_columns, comb_cols, result_row = build_result_row(args, all_results, total_training_time_sec, seeds)
+    write_result_row(args.results_csv, all_columns, comb_cols, result_row)
 
 
 if __name__ == "__main__":

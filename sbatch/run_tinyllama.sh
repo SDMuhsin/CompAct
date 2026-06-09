@@ -62,7 +62,7 @@ techniques=(
     "adalora"
     "dylora"
     "vera"
-    "fourierft"
+    #"fourierft"
     #"spectral"
     # FlashFFN variants (only for methods with effective-weight paths)
     "base_flash"
@@ -75,9 +75,9 @@ techniques=(
 
 # Tasks to evaluate
 tasks=(
-    "cola"
+    #"cola"
     #"mrpc"
-    #"sst2"
+    "sst2"
     #"rte"
     #"qnli"
     #"stsb"
@@ -176,6 +176,17 @@ SPECTRAL_FACTORED_TASKS="sst2 qnli"       # Mode D: factored, no learn_scaling
 # --- FlashFFN ---
 FLASH_FFN_K_FRACTION=0.3
 
+# --- Per-seed splitting (large tasks only) ---
+# Tasks listed here have their Mo5 run as 5 independent per-seed jobs (a SLURM
+# array 0-4) plus one tiny CPU aggregation job, instead of a single multi-day
+# job. This keeps every job far under the wall-time cap, and a failed/timed-out
+# seed costs one seed instead of all five. Reporting is unchanged: the
+# aggregation job writes the same single Mo5 row to the CSV. Submit the script
+# exactly as before — the split is fully transparent.
+SPLIT_BY_SEED_TASKS="sst2 qnli"
+SEEDS_LIST=(41 42 43 44 45)
+SEED_OVERHEAD_MIN=30   # fixed per-seed overhead (model load, tokenize, eval) added on top of time/5
+
 # ============================================================================
 # END CONFIGURATION
 # ============================================================================
@@ -192,6 +203,11 @@ is_wikitext_task() {
         wikitext2|wikitext103) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+should_split_by_seed() {
+    # Large tasks → split Mo5 into a per-seed array job + aggregation (see SPLIT_BY_SEED_TASKS).
+    [[ " $SPLIT_BY_SEED_TASKS " == *" $1 "* ]]
 }
 
 get_job_resources() {
@@ -234,6 +250,7 @@ get_time_limit() {
     #   BoolQ=9427, SST2=67349, QNLI=104743, WT2≈36k chunks (seq=512,batch=8)
     local technique=$1
     local task=$2
+    local per_seed=${3:-0}   # 1 = return per-seed time for a split (array) job
     local minutes=0
 
     local base_tech=$(get_base_technique "$technique")
@@ -269,6 +286,13 @@ get_time_limit() {
             sst2)          minutes=5760  ;;
             qnli)          minutes=8640  ;;
         esac
+    fi
+
+    # Per-seed split: divide the full Mo5 allocation across the 5 seeds and add
+    # fixed per-job overhead (model load, tokenize, eval). Applied before the
+    # FlashFFN multiplier so the buffer compounds correctly.
+    if [[ "$per_seed" == "1" ]]; then
+        minutes=$(( (minutes + 4) / 5 + SEED_OVERHEAD_MIN ))
     fi
 
     # FlashFFN recompute mode adds ~50% overhead for top-K
@@ -412,12 +436,16 @@ echo "Target:     architecture defaults (all 7 for LLaMA)"
 echo "============================================"
 echo ""
 
+account_line=""
+if [[ -n "$ACCOUNT" ]]; then
+    account_line="#SBATCH --account=$ACCOUNT"
+fi
+
 for technique in "${techniques[@]}"; do
     technique_desc=$(get_technique_desc "$technique")
 
     for task in "${tasks[@]}"; do
         epochs=$(get_epochs "$technique" "$task")
-        time_limit=$(get_time_limit "$technique" "$task")
         job_name="${MODEL_SHORT}_${technique}_${task}"
         run_name="${technique}_${MODEL_SHORT}_${task}"
 
@@ -435,12 +463,88 @@ for technique in "${techniques[@]}"; do
             continue
         fi
 
-        account_line=""
-        if [[ -n "$ACCOUNT" ]]; then
-            account_line="#SBATCH --account=$ACCOUNT"
-        fi
+        if should_split_by_seed "$task"; then
+            # ---- Per-seed array (0-4) + dependent CPU aggregation job ----
+            # Each array task trains ONE seed and writes a JSON partial; the
+            # aggregation job (afterany) recombines them into the same Mo5 row.
+            partial_dir="./results/_partial/${run_name}"
+            seed_time=$(get_time_limit "$technique" "$task" 1)
+            rm -rf "$partial_dir"   # start clean so a resubmit never mixes stale seeds
 
-        sbatch_id=$(sbatch --parsable <<EOF
+            array_id=$(sbatch --parsable <<EOF
+#!/bin/bash
+#SBATCH --job-name=${job_name}_seed
+#SBATCH --output=./logs/${job_name}_seed_%A_%a.out
+#SBATCH --error=./logs/${job_name}_seed_%A_%a.err
+#SBATCH --time=$seed_time
+#SBATCH --gpus=$gpu_type
+#SBATCH --mem=$gpu_mem
+#SBATCH --cpus-per-task=4
+#SBATCH --array=0-4
+$account_line
+
+module load gcc arrow scipy-stack cuda cudnn
+source ./env/bin/activate
+
+export HF_HOME=\$(pwd)/data
+export TORCH_HOME=\$(pwd)/data
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+mkdir -p \$HF_HOME
+export PYTHONPATH=\$PYTHONPATH:\$(pwd)/src
+
+SEEDS_ARR=(${SEEDS_LIST[*]})
+SEED=\${SEEDS_ARR[\$SLURM_ARRAY_TASK_ID]}
+echo '========================================'
+echo "Job: $job_name (seed \$SEED, array idx \$SLURM_ARRAY_TASK_ID)"
+echo "Config: $technique_desc | Task: $task | Epochs: $epochs"
+echo "Time limit: $seed_time | Started: \$(date)"
+echo '========================================'
+nvidia-smi
+$python_cmd --seeds \$SEED --partial_dir $partial_dir
+echo '========================================'
+echo "Finished seed \$SEED: \$(date)"
+echo '========================================'
+EOF
+)
+
+            agg_id=$(sbatch --parsable --dependency=afterany:${array_id} <<EOF
+#!/bin/bash
+#SBATCH --job-name=${job_name}_agg
+#SBATCH --output=./logs/${job_name}_agg_%j.out
+#SBATCH --error=./logs/${job_name}_agg_%j.err
+#SBATCH --time=0:30:00
+#SBATCH --mem=16G
+#SBATCH --cpus-per-task=2
+$account_line
+
+module load gcc arrow scipy-stack cuda cudnn
+source ./env/bin/activate
+
+export HF_HOME=\$(pwd)/data
+export TORCH_HOME=\$(pwd)/data
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export PYTHONPATH=\$PYTHONPATH:\$(pwd)/src
+
+echo '========================================'
+echo "Aggregating Mo5: $run_name  (depends on array $array_id)"
+echo "Started: \$(date)"
+echo '========================================'
+$python_cmd --aggregate --partial_dir $partial_dir
+echo '========================================'
+echo "Finished aggregation: \$(date)"
+echo '========================================'
+EOF
+)
+            echo "  [array ${array_id} (0-4, ${seed_time}/seed) -> agg ${agg_id}] $job_name  ($technique_desc, ${task}, ${epochs}ep, SPLIT-BY-SEED)"
+            job_count=$((job_count + 2))
+        else
+            # ---- Single job: all 5 seeds in one process (original behaviour) ----
+            time_limit=$(get_time_limit "$technique" "$task")
+            sbatch_id=$(sbatch --parsable <<EOF
 #!/bin/bash
 #SBATCH --job-name=$job_name
 #SBATCH --output=./logs/${job_name}_%j.out
@@ -481,8 +585,9 @@ echo "Finished: \$(date)"
 echo '========================================'
 EOF
 )
-        echo "  [$sbatch_id] $job_name  ($technique_desc, ${task}, ${epochs}ep, ${time_limit})"
-        ((job_count++))
+            echo "  [$sbatch_id] $job_name  ($technique_desc, ${task}, ${epochs}ep, ${time_limit})"
+            ((job_count++))
+        fi
     done
 done
 
