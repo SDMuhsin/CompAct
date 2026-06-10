@@ -76,13 +76,13 @@ techniques=(
 # Tasks to evaluate
 tasks=(
     #"cola"
-    #"mrpc"
-    "sst2"
-    #"rte"
-    #"qnli"
-    #"stsb"
-    #"boolq"
-    #"cb"
+    "mrpc"
+    #"sst2"
+    "rte"
+    "qnli"
+    "stsb"
+    "boolq"
+    "cb"
     #"wikitext2"
 )
 

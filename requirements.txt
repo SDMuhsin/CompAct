@@ -17,3 +17,4 @@ galore-torch
 huggingface_hub[hf_xet]
 sentencepiece
 scikit-learn
+protobuf

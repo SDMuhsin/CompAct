@@ -110,6 +110,8 @@ from dylora import get_dylora_model, DyLoRAModel, DyLoRALinear
 
 # Import FlashFFN (activation-compressed SwiGLU FFN)
 from flashffn import FlashFFNFunction
+# Import dReLU FlashFFN (activation-compressed dReLU FFN — TurboSparse / Bamboo)
+from flashffn import FlashDReLUFFNFunction
 
 
 
@@ -541,6 +543,89 @@ def _make_flash_forward_module(mlp: nn.Module, kf: float):
     return flash_forward
 
 
+def _is_bamboo_mlp(module: nn.Module) -> bool:
+    """Detect a TurboSparse-Mistral / Bamboo dReLU MLP.
+
+    BambooMLP has the usual gate/up/down projections PLUS a `predictor`
+    sub-MLP (fc1 -> ReLU -> fc2 -> sigmoid) producing a per-neuron sparsity
+    mask, and uses ReLU (dReLU) rather than SiLU.  The `predictor` attribute is
+    the unambiguous signature.
+    """
+    return (hasattr(module, 'gate_proj') and hasattr(module, 'up_proj')
+            and hasattr(module, 'down_proj') and hasattr(module, 'predictor')
+            and hasattr(module.predictor, 'fc1') and hasattr(module.predictor, 'fc2'))
+
+
+def _drelu_proj_weight_fn(proj: nn.Module):
+    """Return a 0-arg callable yielding the gradient-carrying effective weight
+    of one MLP projection, dispatching on adapter type.
+
+    Reuses the same effective-weight computations as the SwiGLU path so every
+    supported trainable-weight method (Full FT, LoRA, DoRA, AdaLoRA, DyLoRA,
+    VeRA) works identically on the dReLU architecture.
+    """
+    if _is_dora_wrapped(proj):
+        return lambda: _compute_dora_effective_weight(proj)
+    if _is_adalora_wrapped(proj):
+        return lambda: _compute_adalora_effective_weight(proj)
+    if _is_lora_wrapped(proj):
+        return lambda: _compute_lora_effective_weight(proj)
+    if _is_dylora_wrapped(proj):
+        return lambda: _compute_dylora_effective_weight(proj)
+    if _is_vera_wrapped(proj):
+        return lambda: _compute_vera_effective_weight(proj)
+    if _is_peft_wrapped(proj):
+        return None  # unsupported PEFT method on dReLU -> caller skips flash
+    return lambda: proj.weight  # plain nn.Linear (Full FT / frozen raw weights)
+
+
+def _make_flash_forward_drelu(mlp: nn.Module, kf: float):
+    """FlashFFN forward for a dReLU (Bamboo) MLP.
+
+    Computes  y = down( mask * ReLU(gate(x)) * ReLU(up(x)) )  via
+    FlashDReLUFFNFunction in recompute mode: only x, the pre-norm residual,
+    the tiny predictor weights, and the top-K compressed h_mid are kept for
+    backward.  The predictor's hard mask is treated as a frozen sparsity
+    oracle and is recomputed in backward rather than stored.
+
+    The returned closure takes BOTH arguments BambooMLP.forward receives
+    (x, before_norm); before_norm is the pre-norm FFN residual feeding the
+    predictor.
+    """
+    wg_fn = _drelu_proj_weight_fn(mlp.gate_proj)
+    wu_fn = _drelu_proj_weight_fn(mlp.up_proj)
+    wd_fn = _drelu_proj_weight_fn(mlp.down_proj)
+    # Predictor weights (raw nn.Linear, bias=False) — never PEFT-wrapped
+    pred_fc1_w = mlp.predictor.fc1.weight
+    pred_fc2_w = mlp.predictor.fc2.weight
+
+    def flash_forward(x, before_norm=None):
+        w_gate = wg_fn()
+        w_up = wu_fn()
+        w_down = wd_fn()
+        return FlashDReLUFFNFunction.apply(
+            x, w_gate, w_up, w_down, kf,
+            before_norm, pred_fc1_w, pred_fc2_w,
+        )
+    return flash_forward
+
+
+def _freeze_bamboo_predictors(model: nn.Module) -> int:
+    """Freeze all Bamboo sparsity-predictor parameters (requires_grad=False).
+
+    The predictor is a fixed sparsity oracle. Freezing it in BOTH the baseline
+    and FlashFFN runs keeps the comparison apples-to-apples (neither updates the
+    predictor) and matches FlashDReLUFFN's design (mask computed without grad).
+    Returns the number of predictor parameters frozen.
+    """
+    n = 0
+    for name, p in model.named_parameters():
+        if '.predictor.' in name and p.requires_grad:
+            p.requires_grad_(False)
+            n += 1
+    return n
+
+
 def apply_flash_ffn(model: nn.Module, k_fraction: float = 0.3) -> int:
     """
     Replace the forward method of SwiGLU MLP modules with FlashFFN.
@@ -584,6 +669,22 @@ def apply_flash_ffn(model: nn.Module, k_fraction: float = 0.3) -> int:
     for name, module in model.named_modules():
         if (hasattr(module, 'gate_proj') and hasattr(module, 'up_proj')
                 and hasattr(module, 'down_proj')):
+            # dReLU / Bamboo MLP (TurboSparse) — checked FIRST because it also
+            # has gate/up/down projections but uses ReLU + a predictor mask and
+            # a 2-argument forward(x, before_norm). The SwiGLU paths below would
+            # be numerically wrong (SiLU) and signature-incompatible here.
+            if _is_bamboo_mlp(module):
+                if _drelu_proj_weight_fn(module.gate_proj) is None:
+                    logger.warning(
+                        f"FlashFFN: skipping {name} — dReLU MLP wrapped by an "
+                        f"unsupported PEFT method (no effective-weight path)."
+                    )
+                    continue
+                module.forward = _make_flash_forward_drelu(module, k_fraction)
+                logger.info(f"FlashFFN applied (dReLU/Bamboo mode, k={k_fraction}) to: {name}")
+                converted += 1
+                continue
+
             # Detect wrapping type for each projection
             dora_wrapped = (
                 _is_dora_wrapped(module.gate_proj)
@@ -1205,7 +1306,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 target_modules = ["query", "key", "value", "dense"]
             elif "gpt2" in args.model_name_or_path.lower() or "gpt-2" in args.model_name_or_path.lower():
                 target_modules = ["c_attn", "c_proj"]
-            elif "llama" in args.model_name_or_path.lower():
+            elif any(k in args.model_name_or_path.lower() for k in ("llama", "mistral", "bamboo", "turbosparse")):
                 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
             elif "opt" in args.model_name_or_path.lower():
                 target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
@@ -1249,7 +1350,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 target_modules = ["query", "key", "value", "dense"]
             elif "gpt2" in args.model_name_or_path.lower() or "gpt-2" in args.model_name_or_path.lower():
                 target_modules = ["c_attn", "c_proj"]
-            elif "llama" in args.model_name_or_path.lower():
+            elif any(k in args.model_name_or_path.lower() for k in ("llama", "mistral", "bamboo", "turbosparse")):
                 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
             elif "opt" in args.model_name_or_path.lower():
                 target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
@@ -1276,7 +1377,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 target_modules = ["query", "value"]
             elif "gpt2" in args.model_name_or_path.lower() or "gpt-2" in args.model_name_or_path.lower():
                 target_modules = ["c_attn", "c_proj"]
-            elif "llama" in args.model_name_or_path.lower():
+            elif any(k in args.model_name_or_path.lower() for k in ("llama", "mistral", "bamboo", "turbosparse")):
                 target_modules = ["q_proj", "v_proj"]
             elif "opt" in args.model_name_or_path.lower():
                 target_modules = ["q_proj", "v_proj"]
@@ -1308,7 +1409,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
             elif "gpt2" in args.model_name_or_path.lower() or "gpt-2" in args.model_name_or_path.lower():
                 # For GPT-2 models
                 target_modules = ["c_attn", "c_proj"]
-            elif "llama" in args.model_name_or_path.lower():
+            elif any(k in args.model_name_or_path.lower() for k in ("llama", "mistral", "bamboo", "turbosparse")):
                 # For LLaMA models
                 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
             elif "opt" in args.model_name_or_path.lower():
@@ -1422,6 +1523,13 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
             logger.info(f"[seed {seed}] Gradient checkpointing enabled")
         else:
             logger.warning(f"[seed {seed}] Model does not support gradient checkpointing, skipping")
+
+    # --- Freeze Bamboo (TurboSparse) sparsity predictors ---
+    # Done for BOTH baseline and FlashFFN so the comparison is apples-to-apples:
+    # the predictor is a fixed sparsity oracle in both cases. (No-op for non-Bamboo models.)
+    n_pred_frozen = _freeze_bamboo_predictors(model)
+    if n_pred_frozen > 0:
+        logger.info(f"[seed {seed}] Froze {n_pred_frozen} Bamboo predictor params (fixed sparsity oracle)")
 
     # --- FlashFFN Application ---
     if args.flash_ffn:

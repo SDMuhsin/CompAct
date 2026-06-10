@@ -474,6 +474,359 @@ class FlashFFNUltraLight(nn.Module):
 
 
 # =============================================================================
+# dReLU FlashFFN  (TurboSparse-Mistral / "Bamboo" architecture)
+# =============================================================================
+#
+# TurboSparse models (arXiv 2406.05955) replace SwiGLU's SiLU gate with dReLU,
+# which applies ReLU to BOTH the gate and up projections before the product:
+#
+#     h_mid = ReLU(x @ W_gate.T) * ReLU(x @ W_up.T)
+#
+# In the released checkpoint (PowerInfer/TurboSparse-Mistral-Instruct, the
+# "Bamboo" custom architecture), h_mid is additionally multiplied by a hard
+# 0/1 sparsity mask produced by a small per-layer "predictor" MLP that reads
+# the *pre-norm residual* (before_norm) of the FFN block:
+#
+#     m    = sigmoid( W_p2 @ ReLU(W_p1 @ before_norm) )      # predictor MLP
+#     mask = round(m)                                        # straight-through
+#     h_mid = mask * h_mid
+#     y     = h_mid @ W_down.T
+#
+# The predictor is treated as a FROZEN sparsity oracle: its hard mask is
+# computed WITHOUT building an autograd graph and is RECOMPUTED in the backward
+# pass (FlashFFN style) rather than stored, so no [N, intermediate] mask tensor
+# ever persists across forward->backward.  This keeps the FlashFFN memory
+# advantage intact on the dReLU architecture.
+#
+# dReLU backward (h_mid = ReLU(g) * ReLU(u)):
+#     grad_g = grad_h_mid * ReLU(u) * 1[g > 0]
+#     grad_u = grad_h_mid * ReLU(g) * 1[u > 0]
+# (ReLU' is a 0/1 step; much cheaper than SiLU'.)
+
+
+@triton.jit
+def _drelu_mul_fwd_kernel(
+    gate_ptr,
+    up_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused ReLU(gate) * ReLU(up) -> out.  Element-wise, 1-D grid."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    gate = tl.load(gate_ptr + offsets, mask=mask).to(tl.float32)
+    up = tl.load(up_ptr + offsets, mask=mask).to(tl.float32)
+
+    rg = tl.where(gate > 0.0, gate, 0.0)
+    ru = tl.where(up > 0.0, up, 0.0)
+
+    tl.store(out_ptr + offsets, rg * ru, mask=mask)
+
+
+@triton.jit
+def _drelu_bwd_kernel(
+    grad_hmid_ptr,
+    gate_ptr,
+    up_ptr,
+    grad_gate_ptr,
+    grad_up_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused backward through h_mid = ReLU(h_gate) * ReLU(h_up).
+
+    Computes:
+      grad_h_gate = grad_h_mid * ReLU(h_up)   * 1[h_gate > 0]
+      grad_h_up   = grad_h_mid * ReLU(h_gate) * 1[h_up   > 0]
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    grad_hmid = tl.load(grad_hmid_ptr + offsets, mask=mask).to(tl.float32)
+    gate = tl.load(gate_ptr + offsets, mask=mask).to(tl.float32)
+    up = tl.load(up_ptr + offsets, mask=mask).to(tl.float32)
+
+    rg = tl.where(gate > 0.0, gate, 0.0)
+    ru = tl.where(up > 0.0, up, 0.0)
+    step_g = tl.where(gate > 0.0, 1.0, 0.0)
+    step_u = tl.where(up > 0.0, 1.0, 0.0)
+
+    grad_h_gate = grad_hmid * ru * step_g
+    grad_h_up = grad_hmid * rg * step_u
+
+    tl.store(grad_gate_ptr + offsets, grad_h_gate, mask=mask)
+    tl.store(grad_up_ptr + offsets, grad_h_up, mask=mask)
+
+
+def triton_drelu_mul(h_gate: torch.Tensor, h_up: torch.Tensor) -> torch.Tensor:
+    """Fused ReLU(h_gate) * ReLU(h_up) using Triton. Replaces F.relu*F.relu*mul."""
+    out = torch.empty_like(h_gate)
+    n_elements = h_gate.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    _drelu_mul_fwd_kernel[grid](h_gate, h_up, out, n_elements, BLOCK_SIZE)
+    return out
+
+
+def triton_drelu_backward(
+    grad_h_mid: torch.Tensor,
+    h_gate: torch.Tensor,
+    h_up: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused backward through dReLU using Triton."""
+    grad_h_gate = torch.empty_like(h_gate)
+    grad_h_up = torch.empty_like(h_up)
+    n_elements = h_gate.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    _drelu_bwd_kernel[grid](
+        grad_h_mid, h_gate, h_up,
+        grad_h_gate, grad_h_up,
+        n_elements, BLOCK_SIZE,
+    )
+    return grad_h_gate, grad_h_up
+
+
+def compute_bamboo_mask(
+    before_norm_2d: torch.Tensor,
+    pred_fc1_w: torch.Tensor,
+    pred_fc2_w: torch.Tensor,
+) -> torch.Tensor:
+    """Recompute the TurboSparse/Bamboo predictor hard mask (0/1).
+
+    mask = round(sigmoid(pred_fc2_w @ ReLU(pred_fc1_w @ before_norm)))
+
+    Matches the predictor MLP in modeling_bamboo.py EXACTLY: fc1 -> ReLU ->
+    fc2 -> sigmoid, both Linear with bias=False, all computed in the input's
+    native dtype (the real model runs the predictor in bf16). Computing in the
+    same dtype reproduces the hard 0/1 mask bit-for-bit, including neurons whose
+    predictor logit sits near the sigmoid=0.5 rounding boundary.
+    """
+    h = F.relu(F.linear(before_norm_2d, pred_fc1_w))
+    m = torch.sigmoid(F.linear(h, pred_fc2_w))
+    return torch.round(m)
+
+
+class FlashDReLUFFNFunction(torch.autograd.Function):
+    """
+    FlashFFN autograd for the dReLU FFN (TurboSparse-Mistral / Bamboo).
+
+    Forward (exact, matches StandardDReLUFFN bit-for-bit up to fp accumulation):
+        h_mid = ReLU(x @ W_gate.T) * ReLU(x @ W_up.T)
+        if predictor provided:  h_mid *= round(sigmoid(predictor(before_norm)))
+        y     = h_mid @ W_down.T
+
+    Always uses recompute-mode backward: stores only x (+ before_norm + tiny
+    predictor weights when masked) and the top-K compressed h_mid.  h_gate /
+    h_up / mask are recomputed in backward.  grad_w_down uses the sparse top-K
+    reconstruction of h_mid (approximate, but ~exact here because the hard mask
+    makes h_mid >=90% zeros, so the top-K keeps every non-zero); grad_x /
+    grad_w_gate / grad_w_up are exact.
+
+    Inputs (5 required + 3 optional for the predictor mask):
+        x, w_gate, w_up, w_down, k_fraction,
+        before_norm=None, pred_fc1_w=None, pred_fc2_w=None
+    Pass the three predictor tensors as None for a plain (maskless) dReLU FFN.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        w_gate: torch.Tensor,
+        w_up: torch.Tensor,
+        w_down: torch.Tensor,
+        k_fraction: float = 0.3,
+        before_norm: Optional[torch.Tensor] = None,
+        pred_fc1_w: Optional[torch.Tensor] = None,
+        pred_fc2_w: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        orig_shape = x.shape
+        batch_seq = x.shape[0] * x.shape[1] if x.dim() == 3 else x.shape[0]
+        hidden_dim = x.shape[-1]
+        intermediate_dim = w_gate.shape[0]
+
+        x_2d = x.reshape(batch_seq, hidden_dim)
+
+        h_gate = F.linear(x_2d, w_gate)               # (N, D) cuBLAS
+        h_up = F.linear(x_2d, w_up)                   # (N, D) cuBLAS
+        h_mid = triton_drelu_mul(h_gate, h_up)        # (N, D) fused Triton
+        del h_gate, h_up
+
+        use_mask = (
+            before_norm is not None
+            and pred_fc1_w is not None
+            and pred_fc2_w is not None
+        )
+        if use_mask:
+            bn_2d = before_norm.reshape(batch_seq, hidden_dim)
+            with torch.no_grad():
+                mask = compute_bamboo_mask(bn_2d, pred_fc1_w, pred_fc2_w).to(h_mid.dtype)
+            h_mid = h_mid * mask
+            del mask
+
+        y = F.linear(h_mid, w_down)                   # (N, H) cuBLAS
+
+        # RECOMPUTE MODE: save x (+ predictor recompute inputs) + compressed top-K
+        k = max(1, int(intermediate_dim * k_fraction))
+        # int16 indices require intermediate_dim < 32768
+        if intermediate_dim >= 32768:
+            raise ValueError(
+                f"FlashDReLUFFN int16 indices require intermediate_dim < 32768, "
+                f"got {intermediate_dim}"
+            )
+        _, top_indices = torch.topk(h_mid.abs(), k, dim=-1, sorted=False)
+        top_values = torch.gather(h_mid, dim=-1, index=top_indices)
+        all_indices = top_indices.to(torch.int16)
+        del h_mid, top_indices
+
+        if use_mask:
+            ctx.save_for_backward(
+                x, w_gate, w_up, w_down, top_values, all_indices,
+                before_norm, pred_fc1_w, pred_fc2_w,
+            )
+        else:
+            ctx.save_for_backward(x, w_gate, w_up, w_down, top_values, all_indices)
+        ctx.use_mask = use_mask
+        ctx.k = k
+        ctx.intermediate_dim = intermediate_dim
+        ctx.orig_shape = orig_shape
+
+        if len(orig_shape) == 3:
+            y = y.view(orig_shape[0], orig_shape[1], hidden_dim)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        orig_shape = ctx.orig_shape
+        batch_seq = orig_shape[0] * orig_shape[1] if len(orig_shape) == 3 else orig_shape[0]
+        hidden_dim = orig_shape[-1]
+
+        grad_output_2d = grad_output.reshape(batch_seq, hidden_dim)
+
+        if ctx.use_mask:
+            (x, w_gate, w_up, w_down, values, indices,
+             before_norm, pred_fc1_w, pred_fc2_w) = ctx.saved_tensors
+        else:
+            x, w_gate, w_up, w_down, values, indices = ctx.saved_tensors
+
+        intermediate_dim = ctx.intermediate_dim
+        x_2d = x.reshape(batch_seq, hidden_dim)
+
+        need_x_grad = ctx.needs_input_grad[0]
+        need_wgate_grad = ctx.needs_input_grad[1]
+        need_wup_grad = ctx.needs_input_grad[2]
+        need_wdown_grad = ctx.needs_input_grad[3]
+
+        # grad_w_down via sparse h_mid reconstruction (h_mid already mask-applied)
+        if need_wdown_grad:
+            h_mid_sparse = torch.zeros(
+                batch_seq, intermediate_dim, device=x.device, dtype=x.dtype
+            )
+            h_mid_sparse.scatter_(dim=-1, index=indices.long(), src=values)
+            grad_w_down = grad_output_2d.t() @ h_mid_sparse
+            del h_mid_sparse
+        else:
+            grad_w_down = None
+
+        if need_x_grad or need_wgate_grad or need_wup_grad:
+            h_gate = F.linear(x_2d, w_gate)
+            h_up = F.linear(x_2d, w_up)
+            grad_h_mid = grad_output_2d @ w_down
+
+            # Re-apply the (recomputed) hard sparsity mask to grad_h_mid: it
+            # gates which neurons contributed to the forward output.
+            if ctx.use_mask:
+                bn_2d = before_norm.reshape(batch_seq, hidden_dim)
+                with torch.no_grad():
+                    mask = compute_bamboo_mask(bn_2d, pred_fc1_w, pred_fc2_w).to(grad_h_mid.dtype)
+                grad_h_mid = grad_h_mid * mask
+                del mask
+
+            grad_h_gate, grad_h_up = triton_drelu_backward(grad_h_mid, h_gate, h_up)
+            del h_gate, h_up, grad_h_mid
+
+            grad_w_gate = grad_h_gate.t() @ x_2d if need_wgate_grad else None
+            grad_w_up = grad_h_up.t() @ x_2d if need_wup_grad else None
+
+            if need_x_grad:
+                grad_x = grad_h_gate @ w_gate + grad_h_up @ w_up
+            else:
+                grad_x = None
+            del grad_h_gate, grad_h_up
+        else:
+            grad_x = None
+            grad_w_gate = None
+            grad_w_up = None
+
+        if need_x_grad and len(orig_shape) == 3:
+            grad_x = grad_x.view(orig_shape)
+
+        # 8 inputs -> 8 grads (k_fraction + 3 predictor tensors get None)
+        return grad_x, grad_w_gate, grad_w_up, grad_w_down, None, None, None, None
+
+
+class StandardDReLUFFN(nn.Module):
+    """Reference (non-compressed) dReLU FFN, optionally with a Bamboo predictor.
+
+    Mirrors BambooMLP's math for verification:
+        h = ReLU(gate(x)) * ReLU(up(x))
+        if mask given:  h = mask * h
+        y = down(h)
+    """
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int, bias: bool = False):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=bias)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        h = F.relu(self.gate_proj(x)) * F.relu(self.up_proj(x))
+        if mask is not None:
+            h = h * mask
+        return self.down_proj(h)
+
+
+class FlashDReLUFFN(nn.Module):
+    """Drop-in dReLU FlashFFN module (no predictor mask).
+
+    For the masked Bamboo variant the model integration passes the predictor
+    weights and the pre-norm residual directly to FlashDReLUFFNFunction.apply;
+    this module is the maskless convenience wrapper used by tests/benchmarks.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        intermediate_dim: int,
+        k_fraction: float = 0.3,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.intermediate_dim = intermediate_dim
+        self.k_fraction = k_fraction
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=bias)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return FlashDReLUFFNFunction.apply(
+            x,
+            self.gate_proj.weight,
+            self.up_proj.weight,
+            self.down_proj.weight,
+            self.k_fraction,
+        )
+
+
+# =============================================================================
 # Testing and Verification
 # =============================================================================
 
