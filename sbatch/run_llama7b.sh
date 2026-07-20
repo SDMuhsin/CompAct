@@ -6,10 +6,23 @@
 # Submits Mo5 (median-of-five, seeds 41-45) benchmarks for PEFT methods with
 # and without FlashFFN on LLaMA-7B (SwiGLU, FlashFFN-compatible).
 #
-# 8 PEFT baselines + 1 Full FT + 7 FlashFFN variants = 16 techniques
+# 8 baselines (Full FT + 7 PEFT) + 7 FlashFFN (v2) variants + 6x|V3_MODES|
+# FlashFFNV3 variants = 15 + 6 = 21 techniques with the default
+# V3_MODES="recompute" -> 21 techniques x 9 tasks = 189 jobs.
+# (V3_MODES="recompute int4" -> 27 techniques -> 243 jobs.)
 # PEFT targets attention only (q_proj, v_proj) → MLP frozen →
 # FlashFFN uses activations mode (always wins, no breakeven).
-# Full FT + FlashFFN excluded: MLP weights trainable → recompute mode → below breakeven.
+# Full FT + FlashFFN (v2) excluded: MLP weights trainable → recompute mode → below breakeven.
+# FlashFFNV3 arms (<tech>_flashffnv3_<mode>): base/lora/dora/adalora/dylora/vera
+# only (train_glue.py raises ValueError for FourierFT/Spectral with
+# --flash_ffn_v3 — by design, NO v3 arms for those). Unlike v2, the Full FT
+# (base) v3 arms ARE included: v3 never materializes W_eff, so there is no
+# recompute-mode breakeven to fall below. v3 arms pass --flash_ffn_v3 <mode>
+# and NEVER --flash_ffn/--flash_ffn_k_fraction. Set the V3_MODES env var to
+# trim modes, or V3_MODES="" to disable all v3 arms.
+# NOTE: this script remains NOT seed-split (one multi-seed Mo5 job per
+# technique x task) — known TODO, out of scope here; v3 arms follow the same
+# single-job structure.
 #
 # NOTE: LLaMA-7B requires significantly more GPU memory than TinyLlama.
 # Gradient checkpointing is enabled by default. Batch sizes are reduced.
@@ -77,6 +90,46 @@ techniques=(
     "fourierft_flash"
     "spectral_flash"
 )
+
+# --- FlashFFNV3 arms (env-overridable) ---
+# V3_MODES: space-separated subset of {int4 int8 bf16 recompute}. The submitter
+# can trim to one mode (V3_MODES="int4" ./sbatch/run_llama7b.sh) or set
+# V3_MODES="" to disable all FlashFFNV3 arms. NOTE: "-" (not ":-") expansion so
+# an explicitly empty V3_MODES="" disables v3 instead of re-enabling the default.
+# DEFAULT = recompute: exact gradients (cos>=0.9999), lightest memory, and the actual
+# novel win (factored adapter math, NO merged-weight storage). int4 is an OPT-IN speed
+# knob (skips the backward recompute GEMMs via generic activation quantization, ~tiny
+# grad error) — it does NOT add memory savings over recompute. Add it via
+# V3_MODES="recompute int4" if you want the speed arm too.
+V3_MODES="${V3_MODES-recompute}"
+# v3-capable techniques (FourierFT/Spectral raise ValueError in train_glue.py
+# with --flash_ffn_v3; base IS included — v3 has no recompute-mode breakeven).
+V3_TECHNIQUES=(base lora dora adalora dylora vera)
+
+# --- V3_ONLY: submit ONLY the FlashFFNV3 arms (skip baselines + v2 _flash) ---
+# Default 0 = full sweep (baselines + v2 _flash + v3, unchanged behaviour). Set
+# V3_ONLY=1 when the baseline and v2 _flash rows are ALREADY in
+# results/mo53_glue.csv from an earlier sweep and you only want to ADD the new
+# v3 rows without re-spending compute re-running arms that already completed.
+# Non-destructive: each v3 arm writes a NEW row keyed by its distinct run name
+# (flash_ffn=v3:<mode>); existing baseline (flash_ffn=False) and v2
+# (flash_ffn=True) rows are left untouched. Pair with V3_MODES to pick modes:
+#   V3_ONLY=1 ./sbatch/run_llama7b.sh                   # add recompute arms only
+#   V3_ONLY=1 V3_MODES="recompute int4" ./sbatch/run_llama7b.sh
+V3_ONLY="${V3_ONLY-0}"
+if [[ "$V3_ONLY" == "1" ]]; then
+    techniques=()   # drop baselines + v2 _flash; the loop below appends only v3
+fi
+
+for _v3_mode in $V3_MODES; do
+    case $_v3_mode in
+        int4|int8|bf16|recompute) ;;
+        *) echo "ERROR: invalid V3_MODES entry '$_v3_mode' (allowed: int4 int8 bf16 recompute)"; exit 1 ;;
+    esac
+    for _v3_tech in "${V3_TECHNIQUES[@]}"; do
+        techniques+=("${_v3_tech}_flashffnv3_${_v3_mode}")
+    done
+done
 
 # Tasks to evaluate
 tasks=(
@@ -206,8 +259,20 @@ is_flash_technique() {
     [[ "$1" == *"_flash" ]]
 }
 
+is_v3_technique() {
+    # FlashFFNV3 arm: <technique>_flashffnv3_<cache_mode>
+    [[ "$1" == *"_flashffnv3_"* ]]
+}
+
+get_v3_mode() {
+    # lora_flashffnv3_int4 -> int4
+    echo "${1##*_flashffnv3_}"
+}
+
 get_base_technique() {
-    echo "${1%_flash}"
+    # Strip _flash / _flashffnv3_<mode> suffix
+    local t="${1%%_flashffnv3_*}"
+    echo "${t%_flash}"
 }
 
 get_epochs() {
@@ -282,6 +347,10 @@ get_time_limit() {
 
     # FlashFFN activations mode has minimal overhead (no top-K)
     # No time adjustment needed for LLaMA-7B flash techniques
+    # FlashFFNV3 arms: measured s/step <= baseline AND <= v2-flash everywhere
+    # (results/v3_adapters/, results/v3_validation/). The conservative rule
+    # v3 limit = max(baseline limit, _flash limit) therefore collapses to the
+    # shared per-task limit above (baseline == _flash here) — no adjustment.
 
     # Format as D-HH:MM:SS or H:MM:SS
     local hours=$((minutes / 60))
@@ -303,7 +372,11 @@ build_python_cmd() {
 
     local base_tech=$(get_base_technique "$technique")
     local flash=""
-    if is_flash_technique "$technique"; then
+    if is_v3_technique "$technique"; then
+        # FlashFFNV3: pass ONLY --flash_ffn_v3 <mode>; never --flash_ffn /
+        # --flash_ffn_k_fraction (mutually exclusive in train_glue.py).
+        flash=" --flash_ffn_v3 $(get_v3_mode "$technique")"
+    elif is_flash_technique "$technique"; then
         flash=" --flash_ffn --flash_ffn_k_fraction $FLASH_FFN_K_FRACTION"
     fi
 
@@ -390,7 +463,9 @@ get_technique_desc() {
     local tech=$1
     local base_tech=$(get_base_technique "$tech")
     local flash_suffix=""
-    if is_flash_technique "$tech"; then
+    if is_v3_technique "$tech"; then
+        flash_suffix=" + FlashFFNV3($(get_v3_mode "$tech"))"
+    elif is_flash_technique "$tech"; then
         flash_suffix=" + FlashFFN(k=$FLASH_FFN_K_FRACTION)"
     fi
     case $base_tech in
@@ -418,6 +493,8 @@ echo "Tasks:      ${tasks[*]}"
 echo "Dtype:      $DTYPE"
 echo "Target:     $TARGET_MODULES (attention-only, activations mode)"
 echo "Grad ckpt:  enabled"
+echo "V3 modes:   ${V3_MODES:-<disabled>} (FlashFFNV3 arms: <tech>_flashffnv3_<mode>)"
+echo "V3 only:    ${V3_ONLY} ($([[ "$V3_ONLY" == "1" ]] && echo "v3 arms ONLY — baselines + v2 _flash skipped" || echo "full sweep: baselines + v2 _flash + v3"))"
 echo "============================================"
 echo ""
 

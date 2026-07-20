@@ -53,6 +53,7 @@ import transformers
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    AutoModelForMultipleChoice,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
@@ -112,6 +113,19 @@ from dylora import get_dylora_model, DyLoRAModel, DyLoRALinear
 from flashffn import FlashFFNFunction
 # Import dReLU FlashFFN (activation-compressed dReLU FFN — TurboSparse / Bamboo)
 from flashffn import FlashDReLUFFNFunction
+# Import FlashFFN v3 (LoRA-factored, quantized GLU-cache; see flashffn.py v3 section)
+from flashffn import make_v3_forward, v3_reset_counters, _V3_COUNTERS
+
+# Import the commonsense multiple-choice paradigm (LLM-Adapters suite):
+# registers decoder-LM *ForMultipleChoice heads, an MC collator, the 170K parser,
+# and the 8 native eval-set loaders.
+from commonsense_mc import (
+    register_mc_models,
+    DataCollatorForMultipleChoice,
+    load_commonsense_train,
+    load_commonsense_eval,
+    COMMONSENSE_EVAL_SETS,
+)
 
 
 
@@ -123,7 +137,11 @@ os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 #                                   constants                                 #
 ###############################################################################
 SEEDS: List[int] = [41, 42, 43, 44, 45]
-CAUSAL_LM_TASKS = {"wikitext2", "wikitext103"}
+CAUSAL_LM_TASKS = {"wikitext2", "wikitext103", "pg19"}
+# Multiple-choice paradigm (P3): a single `--task_name commonsense` trains once on
+# Commonsense-170K and evaluates on all 8 LLM-Adapters sets, writing one row per set
+# (task_name="commonsense_<set>"). See src/commonsense_mc.py and CONTEXT.md §26.
+MULTIPLE_CHOICE_TASKS = {"commonsense"}
 RESULTS_DIR = "./results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 DEFAULT_RESULTS_FILE = os.path.join(RESULTS_DIR, "mo53_glue.csv")
@@ -138,8 +156,15 @@ _METRIC_FOR_TASK = {
     "stsb": "pearson",
     "wnli": "accuracy",
     "cb": "f1",
+    "anli_r1": "accuracy",
+    "anli_r2": "accuracy",
+    "anli_r3": "accuracy",
+    "wanli": "accuracy",
+    "folio": "accuracy",
     "wikitext2": "perplexity",
     "wikitext103": "perplexity",
+    "pg19": "perplexity",
+    "commonsense": "accuracy",  # per-eval-set rows ("commonsense_<set>") default to accuracy too
 }
 
 ###############################################################################
@@ -154,6 +179,28 @@ def _primary_metric(task_name: str, metric_dict: dict) -> float:
     if key == "perplexity":
         return -val if val != float("-inf") else float("-inf")
     return val
+
+
+def _encode_string_label_split(ds, s1_key, s2_key, label_field, class_names):
+    """Normalise a string-labelled (single/pair) classification split into columns
+    (s1_key[, s2_key], label) where `label` is a ClassLabel with a FIXED `class_names`
+    order. Using a fixed order (rather than per-split `class_encode_column`) guarantees
+    train/validation/test label ids can never diverge if a split is missing a class.
+    Raises on any unexpected label string (no silent mislabelling)."""
+    from datasets import ClassLabel
+    name_to_id = {n: i for i, n in enumerate(class_names)}
+
+    def _norm(ex):
+        lab = ex[label_field]
+        if lab not in name_to_id:
+            raise ValueError(f"Unexpected {label_field}={lab!r}; expected one of {class_names}")
+        out = {s1_key: ex[s1_key], "label": name_to_id[lab]}
+        if s2_key is not None:
+            out[s2_key] = ex[s2_key]
+        return out
+
+    ds = ds.map(_norm, remove_columns=ds.column_names)
+    return ds.cast_column("label", ClassLabel(names=class_names))
 
 
 def _load_results_df(results_file: str, columns: List[str]) -> pd.DataFrame:
@@ -743,6 +790,75 @@ def apply_flash_ffn(model: nn.Module, k_fraction: float = 0.3) -> int:
     return converted
 
 
+def apply_flash_ffn_v3(model: nn.Module, cache_mode: str) -> int:
+    """
+    Replace the forward method of SwiGLU MLP modules with FlashFFN v3
+    (LoRA-factored, quantized GLU-cache; see flashffn.py v3 section).
+
+    Walks the model tree exactly like apply_flash_ffn, looking for modules with
+    gate_proj / up_proj / down_proj. Supported per-projection wrapping:
+      - PEFT LoRA (lora.Linear)  -> factored form, no merged W_eff anywhere
+      - plain nn.Linear          -> frozen or trainable (full-FT)
+      - PEFT DoRA / PEFT AdaLoRA / custom DyLoRA / PEFT VeRA -> adapter-factored
+        sibling path (make_v3_forward routes to FlashFFNv3AdapterFunction;
+        thin grads only — DoRA column norm via Gram identity, AdaLoRA A*E and
+        VeRA lambda compositions, DyLoRA per-forward rank slices). Mixed
+        per-projection wrapping is allowed.
+    Each supported MLP's forward is patched via make_v3_forward(mlp, cache_mode).
+
+    UNSUPPORTED adapters on any MLP projection (any other PEFT wrapper) raise
+    ValueError — NO silent fallback. v3 also does not support the dReLU/Bamboo
+    architecture.
+
+    Args:
+        model: The HuggingFace model (possibly wrapped in PEFT).
+        cache_mode: 'int4' | 'int8' | 'bf16' | 'recompute'.
+
+    Returns:
+        Number of MLP modules converted.
+    """
+    converted = 0
+    for name, module in model.named_modules():
+        if (hasattr(module, 'gate_proj') and hasattr(module, 'up_proj')
+                and hasattr(module, 'down_proj')):
+            if _is_bamboo_mlp(module):
+                raise ValueError(
+                    f"FlashFFN v3 does not support the dReLU/Bamboo (TurboSparse) "
+                    f"architecture (found at '{name}'). Use --flash_ffn (v2) instead."
+                )
+            proj_modes = []
+            for proj_name in ('gate_proj', 'up_proj', 'down_proj'):
+                proj = getattr(module, proj_name)
+                if _is_dora_wrapped(proj):
+                    proj_modes.append("DoRA")
+                elif _is_adalora_wrapped(proj):
+                    proj_modes.append("AdaLoRA")
+                elif _is_dylora_wrapped(proj):
+                    proj_modes.append("DyLoRA")
+                elif _is_vera_wrapped(proj):
+                    proj_modes.append("VeRA")
+                elif _is_lora_wrapped(proj):
+                    proj_modes.append("PEFT LoRA")
+                elif _is_peft_wrapped(proj):
+                    raise ValueError(
+                        f"FlashFFN v3 does not support this PEFT wrapper "
+                        f"({type(proj).__name__}) on MLP projections (found at "
+                        f"'{name}.{proj_name}'). Supported: PEFT LoRA, DoRA, "
+                        f"AdaLoRA, DyLoRA, VeRA, plain nn.Linear (frozen or "
+                        f"full-FT). Remove --flash_ffn_v3 for this adapter."
+                    )
+                else:
+                    proj_modes.append("plain Linear")
+            module.forward = make_v3_forward(module, cache_mode=cache_mode)
+            mode_desc = "/".join(sorted(set(proj_modes)))
+            logger.info(
+                f"FlashFFN v3 applied ({mode_desc} factored mode, "
+                f"cache_mode={cache_mode}) to: {name}"
+            )
+            converted += 1
+    return converted
+
+
 ###############################################################################
 #                                   data-keys                                 #
 ###############################################################################
@@ -759,8 +875,14 @@ task_to_keys = {
     "boolq": ("question", "passage"),
     "cb": ("premise", "hypothesis"),
     "anli_r1": ("premise", "hypothesis"),
+    "anli_r2": ("premise", "hypothesis"),
+    "anli_r3": ("premise", "hypothesis"),
+    "wanli": ("premise", "hypothesis"),
+    "folio": ("premises", "conclusion"),
     "wikitext2": (None, None),
     "wikitext103": (None, None),
+    "pg19": (None, None),
+    "commonsense": (None, None),  # multiple-choice; data handled by commonsense_mc
 }
 
 ###############################################################################
@@ -773,9 +895,18 @@ def parse_args():
     parser.add_argument("--model_name_or_path", type=str, required=True, help="Path to pretrained model or model identifier from huggingface.co/models.")
     parser.add_argument("--load_pretrained_model", type=str, default=None, help="Path to a checkpoint to load model weights from.")
     parser.add_argument("--task_name", type=str, required=True, choices=list(task_to_keys.keys()),
-        help="Task name: GLUE/SuperGLUE task or causal LM task (wikitext2, wikitext103).")
+        help="Task name: GLUE/SuperGLUE (cola, sst2, ...), modern NLU (anli_r1/r2/r3, wanli, folio), "
+             "causal LM (wikitext2, wikitext103, pg19), or multiple-choice commonsense "
+             "(commonsense: train on Commonsense-170K, eval on all 8 LLM-Adapters sets).")
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--pad_to_max_length", action="store_true")
+    parser.add_argument("--max_train_samples", type=int, default=None,
+        help="If set, truncate the train split to this many raw examples before preprocessing "
+             "(books for pg19). Useful for smoke tests; REQUIRED in practice for pg19 (huge books) "
+             "where it defaults to 1000 if unset.")
+    parser.add_argument("--max_eval_samples", type=int, default=None,
+        help="If set, truncate the validation split to this many raw examples before preprocessing "
+             "(books for pg19; defaults to 50 for pg19 if unset).")
     parser.add_argument("--use_slow_tokenizer", action="store_true")
 
     # Training Hyperparameters
@@ -882,6 +1013,10 @@ def parse_args():
     # FlashFFN Arguments
     parser.add_argument("--flash_ffn", action="store_true", help="Enable FlashFFN activation compression for SwiGLU MLP blocks. Only works with SwiGLU models (LLaMA, Mistral, etc.).")
     parser.add_argument("--flash_ffn_k_fraction", type=float, default=0.3, help="Fraction of intermediate activations to keep in FlashFFN (default: 0.3 = top 30%%).")
+    parser.add_argument("--flash_ffn_v3", type=str, default=None, choices=["int4", "int8", "bf16", "recompute"],
+                        help="Enable FlashFFN v3 (LoRA-factored, quantized GLU-cache) with the given cache mode. "
+                             "Supports PEFT-LoRA-wrapped or plain (frozen/full-FT) SwiGLU MLPs only; "
+                             "errors out on DoRA/AdaLoRA/DyLoRA/VeRA. Mutually exclusive with --flash_ffn.")
 
     # Results CSV
     parser.add_argument("--results_csv", type=str, default=DEFAULT_RESULTS_FILE, help="Path to the results CSV file (default: ./results/mo53_glue.csv).")
@@ -902,6 +1037,9 @@ def parse_args():
                              "compute the Mo5 median row, write it to the results CSV, and clean up the partials.")
 
     args = parser.parse_args()
+
+    if args.flash_ffn and args.flash_ffn_v3:
+        parser.error("--flash_ffn (v2) and --flash_ffn_v3 are mutually exclusive; pass at most one.")
 
     if args.total_batch_size:
         assert args.total_batch_size % args.per_device_train_batch_size == 0, "total_batch_size must be divisible by per_device_train_batch_size"
@@ -1221,26 +1359,104 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
 
     # --- Data Loading ---
     is_causal_lm = args.task_name in CAUSAL_LM_TASKS
+    is_multiple_choice = args.task_name in MULTIPLE_CHOICE_TASKS
     is_regression = args.task_name == "stsb"
 
-    if is_causal_lm:
-        wikitext_config = "wikitext-2-raw-v1" if args.task_name == "wikitext2" else "wikitext-103-raw-v1"
-        raw_datasets = load_dataset("wikitext", wikitext_config)
+    from datasets import DatasetDict
+    if is_multiple_choice:
+        # Commonsense MC datasets are built AFTER the tokenizer is initialised
+        # (they need it to tokenise (context, choice) pairs). Deferred to the
+        # preprocessing section below.
+        raw_datasets = None
+        num_labels = None
+    elif is_causal_lm:
+        if args.task_name == "pg19":
+            # Long-context book corpus. The canonical `deepmind/pg19` ships a Python
+            # loading script which datasets>=4.0 no longer supports, so use the parquet
+            # mirror `emozilla/pg19` (train split is ~7GB / 23 shards; books are very long).
+            n_train = args.max_train_samples if args.max_train_samples is not None else 1000
+            n_eval = args.max_eval_samples if args.max_eval_samples is not None else 50
+            # HPC compute nodes run fully offline (HF_HUB_OFFLINE / HF_DATASETS_OFFLINE = 1),
+            # where streaming is impossible. There the FULL dataset must already be in the
+            # cache (pre-fetched by sbatch/download_cache.sh); load it and subset (`.select`
+            # is lazy, and only the subset is tokenised below, so memory stays bounded).
+            # Online (e.g. dev box) we stream the first N books so we don't pull the full
+            # ~7GB just to truncate it. Override book counts via --max_*_samples.
+            _offline = (os.environ.get("HF_HUB_OFFLINE") == "1"
+                        or os.environ.get("HF_DATASETS_OFFLINE") == "1")
+            if _offline:
+                logger.info(f"PG-19 (offline): loading cached emozilla/pg19 and subsetting to "
+                            f"{n_train} train / {n_eval} eval books.")
+                _full = load_dataset("emozilla/pg19")
+                raw_datasets = DatasetDict({
+                    "train": _full["train"].select(range(min(n_train, len(_full["train"])))),
+                    "validation": _full["validation"].select(range(min(n_eval, len(_full["validation"])))),
+                })
+            else:
+                import itertools
+                from datasets import Dataset
+                logger.info(f"PG-19 (online): streaming first {n_train} train / {n_eval} eval books "
+                            f"from emozilla/pg19 (avoids the full ~7GB download).")
+                _tr = load_dataset("emozilla/pg19", split="train", streaming=True)
+                _va = load_dataset("emozilla/pg19", split="validation", streaming=True)
+                raw_datasets = DatasetDict({
+                    "train": Dataset.from_list(list(itertools.islice(_tr, n_train))),
+                    "validation": Dataset.from_list(list(itertools.islice(_va, n_eval))),
+                })
+            # Books are already capped above; null the flags so the generic subset block
+            # below doesn't double-truncate.
+            args.max_train_samples = None
+            args.max_eval_samples = None
+        else:
+            wikitext_config = "wikitext-2-raw-v1" if args.task_name == "wikitext2" else "wikitext-103-raw-v1"
+            raw_datasets = load_dataset("wikitext", wikitext_config)
         num_labels = None
     elif args.task_name in ("boolq", "cb"):
         raw_datasets = load_dataset("super_glue", args.task_name)
-    elif args.task_name == "anli_r1":
+    elif args.task_name in ("anli_r1", "anli_r2", "anli_r3"):
+        # Adversarial NLI (Nie et al. 2020): premise/hypothesis -> 3-way (ClassLabel).
+        rnd = args.task_name.split("_")[1]  # r1 / r2 / r3
         _anli = load_dataset("facebook/anli")
-        from datasets import DatasetDict
         raw_datasets = DatasetDict({
-            "train": _anli["train_r1"],
-            "validation": _anli["dev_r1"],
-            "test": _anli["test_r1"],
+            "train": _anli[f"train_{rnd}"],
+            "validation": _anli[f"dev_{rnd}"],
+            "test": _anli[f"test_{rnd}"],
+        })
+    elif args.task_name == "wanli":
+        # WANLI (Liu et al. 2022): worker-AI collaborative NLI. Label col is `gold` (string);
+        # no validation split -> the standard eval set is `test`.
+        _w = load_dataset("alisawuffles/WANLI")
+        _nli_names = ["entailment", "neutral", "contradiction"]
+        raw_datasets = DatasetDict({
+            "train": _encode_string_label_split(_w["train"], "premise", "hypothesis", "gold", _nli_names),
+            "validation": _encode_string_label_split(_w["test"], "premise", "hypothesis", "gold", _nli_names),
+        })
+    elif args.task_name == "folio":
+        # FOLIO (Han et al. 2024): first-order-logic entailment. Label col is `label` (string)
+        # in {True, False, Uncertain}; no test split -> use `validation` for eval.
+        _f = load_dataset("tasksource/folio")
+        _folio_names = ["True", "False", "Uncertain"]
+        raw_datasets = DatasetDict({
+            "train": _encode_string_label_split(_f["train"], "premises", "conclusion", "label", _folio_names),
+            "validation": _encode_string_label_split(_f["validation"], "premises", "conclusion", "label", _folio_names),
         })
     else:
         raw_datasets = load_dataset("glue", args.task_name)
 
-    if not is_causal_lm:
+    # --- Optional subsetting (smoke tests; REQUIRED in practice for PG-19's huge books) ---
+    # (Multiple-choice applies its own subsetting in the commonsense_mc loaders.)
+    _eval_split_name = "validation_matched" if args.task_name == "mnli" else "validation"
+    if not is_multiple_choice:
+        if args.max_train_samples is not None and "train" in raw_datasets:
+            n = min(args.max_train_samples, len(raw_datasets["train"]))
+            raw_datasets["train"] = raw_datasets["train"].select(range(n))
+            logger.info(f"[subset] train -> {n} examples")
+        if args.max_eval_samples is not None and _eval_split_name in raw_datasets:
+            n = min(args.max_eval_samples, len(raw_datasets[_eval_split_name]))
+            raw_datasets[_eval_split_name] = raw_datasets[_eval_split_name].select(range(n))
+            logger.info(f"[subset] {_eval_split_name} -> {n} examples")
+
+    if not is_causal_lm and not is_multiple_choice:
         if not is_regression:
             label_list = raw_datasets["train"].features["label"].names
             num_labels = len(label_list)
@@ -1256,6 +1472,22 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     if is_causal_lm:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
+            trust_remote_code=args.trust_remote_code,
+        )
+    elif is_multiple_choice:
+        # Register the decoder-LM *ForMultipleChoice heads so the literal
+        # AutoModelForMultipleChoice API resolves LLaMA/Mistral (transformers 4.51.3
+        # ships no such head). The `score` head is newly initialised (HF will warn).
+        register_mc_models()
+        config = AutoConfig.from_pretrained(
+            args.model_name_or_path,
+            finetuning_task=args.task_name,
+            trust_remote_code=args.trust_remote_code,
+        )
+        model = AutoModelForMultipleChoice.from_pretrained(
+            args.model_name_or_path,
+            config=config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
             trust_remote_code=args.trust_remote_code,
         )
     else:
@@ -1419,7 +1651,13 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 # Default: try common attention projection names
                 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-            peft_task_type = TaskType.CAUSAL_LM if is_causal_lm else TaskType.SEQ_CLS
+            # Multiple-choice uses a custom head with no PEFT TaskType; task_type=None
+            # gives a generic PeftModel that passes kwargs straight through to our head
+            # (the `score` head is re-enabled for training after adapter setup, below).
+            if is_multiple_choice:
+                peft_task_type = None
+            else:
+                peft_task_type = TaskType.CAUSAL_LM if is_causal_lm else TaskType.SEQ_CLS
             peft_config = None
             if args.adapter_method == 'dora':
                 peft_config = PeftLoraConfig(
@@ -1458,7 +1696,12 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 if args.max_train_steps:
                     est_total_steps = args.max_train_steps
                 else:
-                    n_train = len(raw_datasets["train"])
+                    if is_multiple_choice:
+                        # raw_datasets is None for MC (built post-tokenizer); use the
+                        # known Commonsense-170K size (or the smoke-test subset).
+                        n_train = args.max_train_samples if args.max_train_samples is not None else 170420
+                    else:
+                        n_train = len(raw_datasets["train"])
                     est_steps_per_epoch = math.ceil(n_train / args.per_device_train_batch_size / args.gradient_accumulation_steps)
                     est_total_steps = est_steps_per_epoch * args.num_train_epochs
                 logger.info(f"AdaLoRA: estimated total_step={est_total_steps} for rank allocation schedule")
@@ -1516,10 +1759,40 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
 
     model.to(device)
 
+    # --- Multiple-choice head must always train ---
+    # PEFT (task_type=None) and the custom adapters (spectral/dylora/gbvera) freeze the
+    # whole base model, which includes our newly-initialised `score` head. Re-enable it
+    # uniformly so the head learns regardless of adapter method (no checkpoint round-trip
+    # here, so explicit requires_grad is sufficient — no modules_to_save needed).
+    if is_multiple_choice:
+        n_score = 0
+        for nm, p in model.named_parameters():
+            if "score" in nm:
+                p.requires_grad = True
+                n_score += 1
+        logger.info(f"[seed {seed}] MC head: forced {n_score} 'score' param tensor(s) trainable")
+
     # --- Enable Gradient Checkpointing ---
     if args.gradient_checkpointing:
         if hasattr(model, 'gradient_checkpointing_enable'):
             model.gradient_checkpointing_enable()
+            # Seamlessness-audit fix (2026-06-13): with adapter methods (PEFT &
+            # co.) the embedding output does not require grad, so every
+            # (reentrant) checkpointed block was silently DETACHED from the
+            # autograd graph — adapter weights inside checkpointed layers got
+            # no gradients (torch warns "None of the inputs have
+            # requires_grad=True"; only the task head trained). transformers
+            # only calls enable_input_require_grads() itself when the PEFT
+            # config was loaded through its own integration
+            # (_hf_peft_config_loaded), which peft.get_peft_model() does NOT
+            # set. Mirror that canonical hook here. No-op for full FT
+            # (embedding outputs already require grad). Exposed by the
+            # FlashFFN v3 honesty counter (backward==0 under gc); the
+            # baseline/v2 gc arms were affected silently.
+            if hasattr(model, 'enable_input_require_grads'):
+                model.enable_input_require_grads()
+                logger.info(f"[seed {seed}] enable_input_require_grads() applied "
+                            f"(gradient checkpointing + adapter compatibility)")
             logger.info(f"[seed {seed}] Gradient checkpointing enabled")
         else:
             logger.warning(f"[seed {seed}] Model does not support gradient checkpointing, skipping")
@@ -1543,8 +1816,42 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 f"(LLaMA, Mistral, Qwen, Gemma, etc.), not BERT/RoBERTa/GPT-2/OPT."
             )
 
+    # --- FlashFFN v3 Application (mutually exclusive with --flash_ffn, enforced in parse_args) ---
+    if args.flash_ffn_v3:
+        v3_reset_counters()
+        n_converted_v3 = apply_flash_ffn_v3(model, cache_mode=args.flash_ffn_v3)
+        if n_converted_v3 == 0:
+            raise ValueError(
+                f"--flash_ffn_v3 was requested but no SwiGLU MLP modules (gate_proj/up_proj/down_proj) "
+                f"were found in model '{args.model_name_or_path}'. FlashFFN v3 only works with SwiGLU "
+                f"models (LLaMA, Mistral, Qwen, Gemma, etc.)."
+            )
+        print("=" * 80, flush=True)
+        print(f"[FlashFFN v3] ENABLED | cache_mode={args.flash_ffn_v3} | "
+              f"patched {n_converted_v3} SwiGLU MLP module(s) | honesty counters reset "
+              f"(will be asserted > 0 after the first optimizer step)", flush=True)
+        print("=" * 80, flush=True)
+        logger.info(f"[seed {seed}] FlashFFN v3 enabled: cache_mode={args.flash_ffn_v3}, "
+                    f"converted {n_converted_v3} SwiGLU MLP layers")
+
     # --- Dataset Preprocessing ---
-    if is_causal_lm:
+    eval_loaders = None  # set for multiple-choice (one DataLoader per eval set)
+    if is_multiple_choice:
+        # Train ONCE on Commonsense-170K; evaluate on all 8 sets in this same job.
+        # The 170K is ordered by family, so for a smoke-test subset we shuffle (by seed)
+        # before truncating so every family is represented.
+        train_dataset = load_commonsense_train(
+            tokenizer, args.max_length,
+            n_samples=args.max_train_samples,
+            shuffle_seed=seed if args.max_train_samples is not None else None,
+        )
+        eval_datasets = {
+            name: load_commonsense_eval(name, tokenizer, args.max_length, n_samples=args.max_eval_samples)
+            for name in COMMONSENSE_EVAL_SETS
+        }
+        data_collator = DataCollatorForMultipleChoice(tokenizer)
+        eval_dataset = None
+    elif is_causal_lm:
         # Causal LM: tokenize text, concatenate all tokens, chunk into fixed-length blocks
         block_size = args.max_length
         text_column = "text"
@@ -1593,7 +1900,14 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
         data_collator = default_data_collator if args.pad_to_max_length else DataCollatorWithPadding(tokenizer)
 
     train_loader = DataLoader(train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
-    eval_loader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    if is_multiple_choice:
+        eval_loader = None
+        eval_loaders = {
+            name: DataLoader(ds, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+            for name, ds in eval_datasets.items()
+        }
+    else:
+        eval_loader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
     # --- Optimizer and Scheduler Setup ---
     param_groups = None
@@ -1692,11 +2006,11 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    if is_causal_lm:
-        metric = None  # perplexity computed from loss directly
+    if is_causal_lm or is_multiple_choice:
+        metric = None  # perplexity (causal LM) / accuracy (MC) computed directly
     elif args.task_name in ("boolq", "cb"):
         metric = evaluate.load("super_glue", args.task_name)
-    elif args.task_name == "anli_r1":
+    elif args.task_name in ("anli_r1", "anli_r2", "anli_r3", "wanli", "folio"):
         metric = evaluate.load("accuracy")
     else:
         metric = evaluate.load("glue", args.task_name)
@@ -1710,7 +2024,9 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     mem_stats_after_first_step = {}
     best_metric_val = float("-inf")
     best_metric_dict: Dict[str, float] = {}
-    
+    # Multiple-choice: best accuracy is tracked INDEPENDENTLY per eval set across epochs.
+    best_multi_eval: Dict[str, Dict[str, float]] = {}
+
     # --- Training Loop ---
     for epoch in range(args.num_train_epochs):
         model.train()
@@ -1751,6 +2067,20 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 progress_bar.update(1)
                 completed_steps += 1
 
+                # FlashFFN v3 honesty check: the patched forward/backward must
+                # actually have run by the end of the first optimizer step.
+                if completed_steps == 1 and args.flash_ffn_v3:
+                    _v3_fwd = _V3_COUNTERS["forward"]
+                    _v3_bwd = _V3_COUNTERS["backward"]
+                    if _v3_fwd == 0 or _v3_bwd == 0:
+                        raise RuntimeError(
+                            f"FlashFFN v3 honesty check FAILED after the first optimizer step: "
+                            f"forward counter={_v3_fwd}, backward counter={_v3_bwd} (both must be > 0). "
+                            f"The v3 code path did NOT run despite --flash_ffn_v3={args.flash_ffn_v3}."
+                        )
+                    print(f"[FlashFFN v3] honesty check passed after first optimizer step: "
+                          f"forward={_v3_fwd}, backward={_v3_bwd}", flush=True)
+
                 if completed_steps == 1 and device.type == "cuda":
                     torch.cuda.empty_cache()
                     mem_stats_after_first_step = get_memory_breakdown(model, optimizer, device)
@@ -1767,6 +2097,30 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
         
         # --- Evaluation ---
         model.eval()
+        if is_multiple_choice:
+            # Evaluate on all 8 commonsense sets; track best accuracy per set.
+            for name, loader in eval_loaders.items():
+                correct = 0
+                total = 0
+                for batch in loader:
+                    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                    with torch.no_grad():
+                        outputs = model(**batch)
+                    preds = outputs.logits.argmax(dim=-1)
+                    refs = batch["labels"]
+                    correct += (preds == refs).sum().item()
+                    total += refs.numel()
+                acc = correct / total if total > 0 else float("nan")
+                prev = best_multi_eval.get(name, {}).get("accuracy", float("-inf"))
+                if acc > prev:
+                    best_multi_eval[name] = {"accuracy": acc}
+                logger.info(f"[seed {seed}] epoch {epoch} [{name}]: accuracy={acc:.4f}")
+            mean_acc = sum(v["accuracy"] for v in best_multi_eval.values()) / len(best_multi_eval)
+            logger.info(f"[seed {seed}] epoch {epoch}: commonsense mean(best-per-set) acc={mean_acc:.4f}")
+            if completed_steps >= args.max_train_steps:
+                break
+            continue
+
         if is_causal_lm:
             total_loss = 0.0
             total_tokens = 0
@@ -1797,7 +2151,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
         if primary_val > best_metric_val:
             best_metric_val = primary_val
             best_metric_dict = eval_metric.copy()
-        
+
         if completed_steps >= args.max_train_steps:
             break
             
@@ -1819,7 +2173,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     gc.collect()
     torch.cuda.empty_cache()
 
-    return {
+    result = {
         "best_metric_dict": best_metric_dict,
         "param_mem_mib": mem_stats_after_first_step.get('param_mem_mib', 0),
         "opt_mem_mib": mem_stats_after_first_step.get('opt_mem_mib', 0),
@@ -1829,6 +2183,11 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
         "avg_step_time": avg_step_time,
         "std_step_time": std_step_time,
     }
+    if is_multiple_choice:
+        # One training run produced an accuracy per eval set; carried through the
+        # Mo5 plumbing and expanded into one CSV row per set by build_result_rows().
+        result["multi_eval"] = best_multi_eval
+    return result
 
 ###############################################################################
 #                          Mo5 aggregation helpers                            #
@@ -1861,6 +2220,12 @@ def _write_partial_result(partial_dir: str, seed: int, res: Dict, single_seed_ti
         "best_metric_dict": {k: _nan_to_none(v) for k, v in res["best_metric_dict"].items()},
         "single_seed_train_time_sec": single_seed_time,
     }
+    if "multi_eval" in res:
+        # Multiple-choice: per-eval-set best metrics (one row per set is built later).
+        payload["multi_eval"] = {
+            name: {k: _nan_to_none(v) for k, v in md.items()}
+            for name, md in res["multi_eval"].items()
+        }
     for k in _PARTIAL_STAT_KEYS:
         payload[k] = _nan_to_none(res.get(k, np.nan))
     final = os.path.join(partial_dir, f"seed_{seed}.json")
@@ -1887,6 +2252,11 @@ def _read_partial_results(partial_dir: str) -> List[Dict]:
                                  for k, v in p.get("best_metric_dict", {}).items()},
             "single_seed_train_time_sec": p.get("single_seed_train_time_sec", 0.0) or 0.0,
         }
+        if "multi_eval" in p:
+            rec["multi_eval"] = {
+                name: {k: (np.nan if v is None else v) for k, v in md.items()}
+                for name, md in p["multi_eval"].items()
+            }
         for k in _PARTIAL_STAT_KEYS:
             v = p.get(k, np.nan)
             rec[k] = np.nan if v is None else v
@@ -2010,7 +2380,7 @@ def build_result_row(args, per_seed_results: List[Dict], total_training_time_sec
         "spectral_learn_scaling": args.spectral_learn_scaling if args.adapter_method == 'spectral' else 'N/A',
         "per_layer_opt": args.per_layer_opt,
         "gradient_checkpointing": args.gradient_checkpointing,
-        "flash_ffn": args.flash_ffn,
+        "flash_ffn": (f"v3:{args.flash_ffn_v3}" if getattr(args, "flash_ffn_v3", None) else args.flash_ffn),
         "flash_ffn_k_fraction": args.flash_ffn_k_fraction if args.flash_ffn else 'N/A',
         "accuracy": median_metrics.get("accuracy", np.nan),
         "f1": median_metrics.get("f1", np.nan),
@@ -2029,6 +2399,32 @@ def build_result_row(args, per_seed_results: List[Dict], total_training_time_sec
         "seed": ",".join(map(str, seeds_used)),
     }
     return all_columns, comb_cols, result_row
+
+
+def build_result_rows(args, per_seed_results: List[Dict], total_training_time_sec: float,
+                      seeds_used: List[int]):
+    """Return a LIST of (all_columns, comb_cols, result_row) tuples.
+
+    Standard tasks -> exactly one row (delegates to build_result_row). The
+    multiple-choice commonsense task trains ONCE but evaluates on 8 sets, so it
+    emits one row per set (task_name="commonsense_<set>"). Each per-set row reuses
+    build_result_row with that set's per-seed accuracies, so Mo5 aggregation,
+    memory/time columns, and the upsert key all behave exactly as for any other
+    task (the shared training job's memory/time stats are replicated across the 8
+    rows, which is correct — they describe the one job that produced all 8)."""
+    if per_seed_results and "multi_eval" in per_seed_results[0]:
+        rows = []
+        for name in COMMONSENSE_EVAL_SETS:
+            sub_results = []
+            for r in per_seed_results:
+                rr = dict(r)
+                rr["best_metric_dict"] = r.get("multi_eval", {}).get(name, {})
+                sub_results.append(rr)
+            sub_args = copy.deepcopy(args)
+            sub_args.task_name = f"commonsense_{name}"
+            rows.append(build_result_row(sub_args, sub_results, total_training_time_sec, seeds_used))
+        return rows
+    return [build_result_row(args, per_seed_results, total_training_time_sec, seeds_used)]
 
 
 ###############################################################################
@@ -2051,10 +2447,11 @@ def main():
         if len(seeds_used) < len(SEEDS):
             logger.warning(f"Aggregating only {len(seeds_used)}/{len(SEEDS)} seeds ({seeds_used}); "
                            f"some seed jobs may have failed or not finished.")
-        all_columns, comb_cols, result_row = build_result_row(
-            args, per_seed_results, total_training_time_sec, seeds_used)
-        if write_result_row(args.results_csv, all_columns, comb_cols, result_row):
-            logger.info(f"Aggregated Mo{len(seeds_used)} over seeds {seeds_used} -> {args.results_csv}")
+        rows = build_result_rows(args, per_seed_results, total_training_time_sec, seeds_used)
+        ok = all(write_result_row(args.results_csv, ac, cc, rr) for ac, cc, rr in rows)
+        if ok:
+            logger.info(f"Aggregated Mo{len(seeds_used)} over seeds {seeds_used} "
+                        f"({len(rows)} row(s)) -> {args.results_csv}")
             try:
                 shutil.rmtree(args.partial_dir)
                 logger.info(f"Removed partial dir {args.partial_dir}")
@@ -2086,8 +2483,8 @@ def main():
         return
 
     total_training_time_sec = time.time() - training_start_time
-    all_columns, comb_cols, result_row = build_result_row(args, all_results, total_training_time_sec, seeds)
-    write_result_row(args.results_csv, all_columns, comb_cols, result_row)
+    for all_columns, comb_cols, result_row in build_result_rows(args, all_results, total_training_time_sec, seeds):
+        write_result_row(args.results_csv, all_columns, comb_cols, result_row)
 
 
 if __name__ == "__main__":
