@@ -39,6 +39,18 @@ from functools import reduce
 from pathlib import Path
 from typing import Dict, List
 
+# `evaluate` does NOT honour HF_HUB_OFFLINE / HF_DATASETS_OFFLINE. On an offline
+# compute node `evaluate.load("glue", ...)` probes the Hub for three module types
+# (metric/comparison/measurement) before falling back to the local cache; each
+# probe blocks until the HTTP timeout expires, costing ~44 min PER SEED (measured
+# identically in the 2026-03 and 2026-07 HPC sweeps — it is what killed every CB
+# job in the 2026-07-19 v3 run). `evaluate` has its own switch, HF_EVALUATE_OFFLINE,
+# which raises OfflineModeIsEnabled (a ConnectionError subclass) immediately and
+# drops straight through to CachedEvaluationModuleFactory. Mirror the hub flag onto
+# it. Must run BEFORE `import evaluate` — evaluate.config reads the env at import.
+if os.environ.get("HF_HUB_OFFLINE", "").upper() in ("1", "TRUE", "YES", "ON"):
+    os.environ.setdefault("HF_EVALUATE_OFFLINE", "1")
+
 import datasets
 import evaluate
 import numpy as np
@@ -1706,6 +1718,33 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                     est_total_steps = est_steps_per_epoch * args.num_train_epochs
                 logger.info(f"AdaLoRA: estimated total_step={est_total_steps} for rank allocation schedule")
 
+                # Short-schedule guard. PEFT requires tinit < total_step - tfinal,
+                # and a budgeting phase shorter than deltaT allocates nothing. The
+                # paper defaults (tinit=tfinal=200) exceed the whole run on small
+                # tasks (RTE=390 steps, CB=40) and raise
+                #   "The supplied schedule values don't allow for a budgeting phase."
+                # which killed the AdaLoRA rte/cb arms in the 2026-07-19 sweep.
+                # Only intervene when the schedule is actually infeasible: rescale
+                # tinit/tfinal to half the run, preserving their requested ratio, so
+                # the budgeting phase gets the other half. Runs with a feasible
+                # schedule (mrpc=580, stsb=900, cola=1340, qnli=16370, ...) are left
+                # BYTE-IDENTICAL, so previously completed rows stay comparable.
+                adalora_tinit, adalora_tfinal = args.adalora_tinit, args.adalora_tfinal
+                if est_total_steps - adalora_tinit - adalora_tfinal < max(args.adalora_deltaT, 1):
+                    sched = max(est_total_steps // 2, 0)
+                    ratio = adalora_tinit / max(adalora_tinit + adalora_tfinal, 1)
+                    adalora_tinit = int(sched * ratio)
+                    adalora_tfinal = sched - adalora_tinit
+                    if adalora_tinit >= est_total_steps - adalora_tfinal:
+                        adalora_tinit = adalora_tfinal = 0   # run too short to schedule at all
+                    logger.warning(
+                        f"AdaLoRA: requested tinit={args.adalora_tinit}/tfinal={args.adalora_tfinal} leaves no "
+                        f"budgeting phase in total_step={est_total_steps}; rescaled to "
+                        f"tinit={adalora_tinit}/tfinal={adalora_tfinal} "
+                        f"(budgeting phase = {est_total_steps - adalora_tinit - adalora_tfinal} steps). "
+                        f"The rank-allocation schedule for this task therefore DIFFERS from the paper default."
+                    )
+
                 peft_config = AdaLoraConfig(
                     init_r=args.adalora_init_r,
                     target_r=args.adalora_target_r,
@@ -1715,8 +1754,8 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                     bias="none",
                     task_type=peft_task_type,
                     total_step=est_total_steps,
-                    tinit=args.adalora_tinit,
-                    tfinal=args.adalora_tfinal,
+                    tinit=adalora_tinit,
+                    tfinal=adalora_tfinal,
                     deltaT=args.adalora_deltaT,
                     orth_reg_weight=args.adalora_orth_reg_weight,
                 )

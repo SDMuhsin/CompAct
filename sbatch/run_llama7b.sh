@@ -546,6 +546,7 @@ export TORCH_HOME=\$(pwd)/data
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+export HF_EVALUATE_OFFLINE=1   # the evaluate lib ignores HF_HUB_OFFLINE; without this, evaluate.load probes the Hub and stalls ~44 min PER SEED
 mkdir -p \$HF_HOME
 
 echo '========================================'

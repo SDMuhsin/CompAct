@@ -501,6 +501,7 @@ export TORCH_HOME=\$(pwd)/data
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+export HF_EVALUATE_OFFLINE=1   # the evaluate lib ignores HF_HUB_OFFLINE; without this, evaluate.load probes the Hub and stalls ~44 min PER SEED
 # Reduce CUDA allocator fragmentation on the long (multi-day), memory-tight 40 GB
 # runs. Harmless on the 80 GB DoRA jobs. Keeps peak well under the slice limit.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -540,6 +541,7 @@ export TORCH_HOME=\$(pwd)/data
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+export HF_EVALUATE_OFFLINE=1   # the evaluate lib ignores HF_HUB_OFFLINE; without this, evaluate.load probes the Hub and stalls ~44 min PER SEED
 export PYTHONPATH=\$PYTHONPATH:\$(pwd)/src
 
 echo '========================================'
