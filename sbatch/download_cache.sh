@@ -13,6 +13,15 @@
 
 set -e
 
+# Same module set as the generated sbatch job scripts, minus cuda/cudnn (no GPU
+# needed to download). scipy-stack is what supplies numpy — the venv is built
+# against system site-packages, so without it `import datasets` dies with
+# "ModuleNotFoundError: No module named 'numpy'". Guarded so the script still
+# runs on a box with no Lmod (e.g. the dev machine).
+if command -v module >/dev/null 2>&1; then
+    module load gcc arrow scipy-stack
+fi
+
 source ./env/bin/activate
 
 export HF_HOME=$(pwd)/data

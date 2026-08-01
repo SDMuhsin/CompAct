@@ -137,6 +137,35 @@ for _v3_mode in $V3_MODES; do
     done
 done
 
+# --- TECHNIQUES: submit ONLY the listed arms (gap-fill / rerun) --------------
+# Space-separated subset of the generated technique list; empty = all of them.
+# EVERY arm here is split-by-seed, and every submission starts with
+#   rm -rf ./results/_partial/<run_name>
+# so running this script unfiltered while an earlier array is still queued or
+# running DESTROYS that arm's already-completed per-seed partials (hours of GPU
+# each, unrecoverable). Always pass an explicit TECHNIQUES list when topping up
+# a partially-finished sweep; the pre-flight check further down is the backstop.
+#   TECHNIQUES="adalora_flash vera_flash" ./sbatch/run_commonsense.sh
+TECHNIQUES="${TECHNIQUES-}"
+if [[ -n "$TECHNIQUES" ]]; then
+    _sel=()
+    for _t in $TECHNIQUES; do
+        if [[ " ${techniques[*]} " != *" $_t "* ]]; then
+            echo "ERROR: TECHNIQUES entry '$_t' is not one of the generated arms."
+            echo "       Generated: ${techniques[*]}"
+            echo "       (v3 arms depend on V3_MODES='${V3_MODES}')"
+            exit 1
+        fi
+        _sel+=("$_t")
+    done
+    techniques=("${_sel[@]}")
+fi
+
+# --- CLOBBER_PARTIALS: allow a submit to delete existing per-seed partials ---
+CLOBBER_PARTIALS="${CLOBBER_PARTIALS-0}"
+# --- ALLOW_QUEUED_DUPES: allow resubmitting an arm already in the SLURM queue --
+ALLOW_QUEUED_DUPES="${ALLOW_QUEUED_DUPES-0}"
+
 # ============================================================================
 # HYPERPARAMETERS (reuse the validated TinyLlama Mo5 configs; CONTEXT.md section 26
 # explicitly DEFERS per-LLM-Adapters-paper HP tuning, so we reuse the LoRA-family
@@ -445,12 +474,62 @@ echo "Epochs:     $CS_EPOCHS | batch=$BATCH_SIZE seq=$MAX_LENGTH total_batch=$TO
 echo "Per-seed:   array 0-4 + CPU aggregation (always split)"
 echo "V3 modes:   ${V3_MODES:-<disabled>} (FlashFFNV3 arms: <tech>_flashffnv3_<mode>)"
 echo "V3 only:    ${V3_ONLY} ($([[ "$V3_ONLY" == "1" ]] && echo "v3 arms ONLY — baselines + v2 _flash skipped" || echo "full sweep: baselines + v2 _flash + v3"))"
+echo "Techniques filter: ${TECHNIQUES:-<none — all generated arms>}"
 echo "============================================"
 echo ""
 
 account_line=""
 if [[ -n "$ACCOUNT" ]]; then
     account_line="#SBATCH --account=$ACCOUNT"
+fi
+
+# --- PRE-FLIGHT: don't clobber partials, don't duplicate in-flight arms -------
+# See the TECHNIQUES note above: each submission clears its arm's partial dir.
+# Two hazards, both checked BEFORE any job goes out:
+#   (a) completed per-seed partials that the clear would discard;
+#   (b) an arm whose array is already queued/running — a partial is written only
+#       when a seed FINISHES, so a mid-training array is invisible to (a), and a
+#       duplicate array would race it for the same partial dir and CSV row.
+if [[ "$LOCAL_MODE" != true ]]; then
+    queued_names=""
+    if command -v squeue >/dev/null 2>&1; then
+        queued_names=$(squeue -u "${USER:-$(whoami)}" -h -o '%j' 2>/dev/null)
+    fi
+    at_risk=(); in_queue=()
+    for technique in "${techniques[@]}"; do
+        _job="${MODEL_SHORT}_cs_${technique}"
+        if [[ -n "$queued_names" ]] \
+           && grep -qxF -e "$_job" -e "${_job}_seed" -e "${_job}_agg" <<< "$queued_names"; then
+            in_queue+=("$_job")
+        fi
+        _d="./results/_partial/${technique}_${MODEL_SHORT}_commonsense"
+        [[ -d "$_d" ]] || continue
+        _n=$(find "$_d" -maxdepth 1 -name 'seed_*.json' 2>/dev/null | wc -l)
+        [[ "${_n// /}" -gt 0 ]] && at_risk+=("$_d (${_n// /} seed partial(s))")
+    done
+    if [[ ${#in_queue[@]} -gt 0 ]]; then
+        echo "ERROR: ${#in_queue[@]} selected arm(s) are ALREADY in the SLURM queue:"
+        printf '         %s\n' "${in_queue[@]}"
+        echo ""
+        echo "       Submitting again would race the running array (same partial dir, same CSV"
+        echo "       row). Wait for them, or restrict with TECHNIQUES=\"...\"."
+        echo "       Override: ALLOW_QUEUED_DUPES=1."
+        [[ "$ALLOW_QUEUED_DUPES" == "1" ]] || exit 1
+        echo "  [WARN] ALLOW_QUEUED_DUPES=1 — submitting duplicates anyway."
+        echo ""
+    fi
+    if [[ ${#at_risk[@]} -gt 0 ]]; then
+        echo "ERROR: ${#at_risk[@]} arm(s) already hold completed per-seed partials that this"
+        echo "       submission would DELETE:"
+        printf '         %s\n' "${at_risk[@]}"
+        echo ""
+        echo "       Check squeue -u \$USER first — an array or its aggregation may still be"
+        echo "       pending for these arms. Restrict the submission with TECHNIQUES=\"...\","
+        echo "       or re-run with CLOBBER_PARTIALS=1 to discard them deliberately."
+        [[ "$CLOBBER_PARTIALS" == "1" ]] || exit 1
+        echo "  [WARN] CLOBBER_PARTIALS=1 — discarding the partials listed above."
+        echo ""
+    fi
 fi
 
 for technique in "${techniques[@]}"; do
