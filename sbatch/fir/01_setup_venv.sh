@@ -42,16 +42,49 @@ echo; echo "--- linking venv/data onto /scratch ---"
 fir_link_scratch || exit 1
 
 # --- 2. create the venv
+# ⚠ A HALF-BUILT VENV MUST BE DETECTED, NOT INHERITED.
+# CPython's venv runs `_setup_pip` (ensurepip) BEFORE `setup_scripts` (which writes
+# bin/activate), so a Ctrl-C during ensurepip — which is exactly what happens when
+# the slow Lustre/CVMFS create looks hung — leaves `bin/python` present and
+# `bin/activate` absent. Checking only for bin/python then "finds" a venv, skips
+# creation, and every later step dies on `./env/bin/activate: No such file`.
+# Observed on fir 2026-08-11. Validate by RUNNING the interpreter, not by stat.
+venv_is_healthy() {
+    [ -x "$FIR_VENV/bin/python" ] && [ -f "$FIR_VENV/bin/activate" ] \
+        && "$FIR_VENV/bin/python" -c "import sys, ensurepip" >/dev/null 2>&1
+}
+
 if $FRESH && [ -d "$FIR_VENV_REAL" ]; then
-    echo "--fresh: removing $FIR_VENV_REAL"; rm -rf "$FIR_VENV_REAL"; mkdir -p "$FIR_VENV_REAL"
+    echo "--fresh: removing $FIR_VENV_REAL"; rm -rf "$FIR_VENV_REAL"
 fi
-if [ ! -x "$FIR_VENV/bin/python" ]; then
+if ! venv_is_healthy; then
+    if [ -e "$FIR_VENV_REAL/bin" ]; then
+        echo; echo "--- found a BROKEN/partial venv at $FIR_VENV_REAL — removing and rebuilding ---"
+        echo "    (bin/python:  $([ -x "$FIR_VENV/bin/python" ] && echo present || echo missing))"
+        echo "    (bin/activate:$([ -f "$FIR_VENV/bin/activate" ] && echo present || echo missing))"
+        rm -rf "$FIR_VENV_REAL"
+    fi
+    mkdir -p "$FIR_VENV_REAL"
     echo; echo "--- creating venv at $FIR_VENV_REAL ---"
+    echo "    NOTE: this takes 1-3 minutes on /scratch (Lustre + CVMFS python). It is NOT hung."
+    echo "    Do not Ctrl-C; if you must, re-run this script and it will repair itself."
     # --system-site-packages is REQUIRED, not stylistic: numpy comes from the
-    # scipy-stack module. Without it `import datasets` dies with
-    # "ModuleNotFoundError: No module named 'numpy'" (the rorqual scripts carry
-    # the same note). Everything we pin below still shadows the system copy.
-    python -m venv --system-site-packages "$FIR_VENV_REAL" || exit 1
+    # scipy-stack module, and the venv is built against it. Without it
+    # `import datasets` dies with "ModuleNotFoundError: No module named 'numpy'"
+    # (the rorqual scripts carry the same note). Our pins still shadow the system copy.
+    #
+    # `virtualenv --no-download` is Alliance's recommended path and is markedly
+    # faster/more reliable here than `python -m venv`, because it seeds pip from the
+    # local wheelhouse instead of running ensurepip. Fall back if it is absent.
+    if command -v virtualenv >/dev/null 2>&1; then
+        echo "    using: virtualenv --no-download --system-site-packages"
+        virtualenv --no-download --system-site-packages "$FIR_VENV_REAL" || exit 1
+    else
+        echo "    using: python -m venv --system-site-packages (virtualenv not on PATH)"
+        python -m venv --system-site-packages "$FIR_VENV_REAL" || exit 1
+    fi
+    venv_is_healthy || { echo "FAIL: venv still not healthy after creation"; exit 1; }
+    echo "    venv created OK"
 fi
 # shellcheck disable=SC1091
 source "$FIR_VENV/bin/activate" || exit 1

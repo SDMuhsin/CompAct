@@ -28,7 +28,17 @@ echo "############ fir download cache — $(date -u +%FT%TZ) ############"
 fir_load_modules_cpu || { echo "FAIL: module load '$FIR_MODULES_CPU'"; exit 1; }
 fir_link_scratch || exit 1
 # shellcheck disable=SC1091
-source "$FIR_VENV/bin/activate" || { echo "FAIL: no venv — run 01_setup_venv.sh"; exit 1; }
+if [ ! -f "$FIR_VENV/bin/activate" ]; then
+    echo "FAIL: no usable venv at $(readlink -f "$FIR_VENV" 2>/dev/null || echo "$FIR_VENV")"
+    echo "  bin/python:   $([ -x "$FIR_VENV/bin/python" ] && echo present || echo missing)"
+    echo "  bin/activate: missing"
+    echo "  -> run:  bash sbatch/fir/01_setup_venv.sh"
+    echo "     (if bin/python is present but activate is missing, the venv is HALF-BUILT from an"
+    echo "      interrupted create; 01_setup_venv.sh now detects that and rebuilds automatically.)"
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "$FIR_VENV/bin/activate" || exit 1
 fir_export_online                       # ONLINE: no *_OFFLINE flags here
 
 echo "cache -> $(readlink -f "$FIR_DATA")"
