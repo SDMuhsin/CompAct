@@ -66,8 +66,8 @@ if ! venv_is_healthy; then
     fi
     mkdir -p "$FIR_VENV_REAL"
     echo; echo "--- creating venv at $FIR_VENV_REAL ---"
-    echo "    NOTE: this takes 1-3 minutes on /scratch (Lustre + CVMFS python). It is NOT hung."
-    echo "    Do not Ctrl-C; if you must, re-run this script and it will repair itself."
+    echo "    NOTE: MEASURED on fir — virtualenv ~10s, python -m venv ~15s. Not minutes."
+    echo "    If it sits far longer, something IS wrong. Re-running repairs a partial venv."
     # --system-site-packages is REQUIRED, not stylistic: numpy comes from the
     # scipy-stack module, and the venv is built against it. Without it
     # `import datasets` dies with "ModuleNotFoundError: No module named 'numpy'"
@@ -107,9 +107,8 @@ if ! venv_is_healthy; then
         done
     fi
     if ! $created; then
-        echo "    falling back to: python -m venv --system-site-packages"
-        echo "    (slower — ensurepip on Lustre — but it does not read CVMFS zips."
-        echo "     EXPECT 1-3 MINUTES OF SILENCE HERE. This is the step to let finish.)"
+        echo "    falling back to: python -m venv --system-site-packages (~15s, measured)"
+        echo "    (ensurepip instead of the CVMFS app-data zip extract — survives the EIO above)"
         rm -rf "$FIR_VENV_REAL"; mkdir -p "$FIR_VENV_REAL"
         python -m venv --system-site-packages "$FIR_VENV_REAL" || {
             echo "FAIL: both virtualenv and python -m venv failed to create $FIR_VENV_REAL"
