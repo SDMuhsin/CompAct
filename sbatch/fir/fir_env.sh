@@ -2,44 +2,142 @@
 # ============================================================================
 # fir_env.sh — THE SINGLE SOURCE OF TRUTH for the fir environment.
 # ============================================================================
-# Sourced by every other script in this directory. Nothing else defines a module
-# line, an offline flag, or a path. If a value is wrong, it is wrong in exactly
-# one place.
+# Sourced by every other script here. Nothing else defines a module line, an
+# offline flag, a GPU string, an account or a path.
 #
-#   source sbatch/fir/fir_env.sh          # sets vars, does NOT load modules
-#   fir_load_modules_gpu                  # compute-node module set
-#   fir_load_modules_cpu                  # login/CPU set (no cuda/cudnn)
-#   fir_export_offline                    # the offline env, compute nodes
-#   fir_export_online                     # the online env, login node downloads
-#   fir_assert_env                        # FAIL FAST — run before any real work
+#   source sbatch/fir/fir_env.sh
+#   fir_load_modules_gpu / fir_load_modules_cpu
+#   fir_export_offline  / fir_export_online
+#   fir_assert_env [gpu|cpu]      # FAIL FAST before any real work
 #
-# ⚠ EVERY VALUE MARKED `PROBE:` IS CARRIED OVER FROM RORQUAL AND IS UNVERIFIED ON
-#   FIR. Run `sbatch/fir/00_probe_fir.sh` and correct them here BEFORE submitting
-#   anything. They are deliberately NOT guessed a second time somewhere else.
+# ALL VALUES BELOW ARE MEASURED ON FIR by `00_probe_fir.sh` (2026-08-11,
+# login1.int.fir.alliancecan.ca). Where fir differs from rorqual the rorqual
+# value is kept in a comment, because silently dropping it loses the reason.
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# Module set. ⚠ ORDER IS LOAD-BEARING — do not "tidy" it.
-#   gcc          toolchain first; arrow/scipy-stack are built against it
-#   arrow        pyarrow for `datasets`
-#   scipy-stack  supplies NUMPY. The venv is built with --system-site-packages,
-#                so WITHOUT this `import datasets` dies with
-#                "ModuleNotFoundError: No module named 'numpy'"
-#   cuda cudnn   GPU only; omitted on the download/login path on purpose
-# PROBE: confirm these names/versions exist on fir and that this order works.
+# MODULES — ⚠ ORDER IS LOAD-BEARING, AND FIR PROVES IT.
+#
+#   `module avail cudnn` on fir returns "No module(s) found" ON ITS OWN.
+#   cudnn is CUDA-dependent in the Lmod hierarchy and only becomes visible AFTER
+#   `cuda` is loaded. So `... cuda cudnn` works (probe: exit=0) and any reorder
+#   that puts cudnn before cuda FAILS. This is exactly why the rorqual order is
+#   copied verbatim rather than tidied.
+#
+# VERIFIED on fir: the rorqual line loads cleanly and yields
+#   cuda/12.6, cudnn/9.10.0.56, nccl/2.26.2, python/3.11.5, numpy 2.4.2
+# Note fir ALREADY loads gcc/12.3, arrow/25.0.0, scipy-stack/2026a, python/3.11.5
+# by default; loading them explicitly is a no-op that also protects against a
+# future default change. Keep it.
 # ---------------------------------------------------------------------------
 FIR_MODULES_CPU="${FIR_MODULES_CPU:-gcc arrow scipy-stack}"
 FIR_MODULES_GPU="${FIR_MODULES_GPU:-gcc arrow scipy-stack cuda cudnn}"
 
-# PROBE: rorqual used these. fir's GPU names and MIG slice names may differ.
-FIR_GPU_FULL="${FIR_GPU_FULL:-h100:1}"
-FIR_GPU_MIG="${FIR_GPU_MIG:-h100_3g.40gb:1}"
-FIR_ACCOUNT="${FIR_ACCOUNT:-def-seokbum}"        # PROBE: confirm on fir
+# ---------------------------------------------------------------------------
+# GPUS — ⚠ FIR'S NAMES ARE NOT RORQUAL'S. Using rorqual's string fails outright.
+#   fir Gres (probe §8):  gpu:h100:4
+#                         gpu:nvidia_h100_80gb_hbm3_3g.40gb:4
+#                         gpu:nvidia_h100_80gb_hbm3_2g.20gb:4
+#                         gpu:nvidia_h100_80gb_hbm3_1g.10gb:8
+#   rorqual was:          h100:1  and  h100_3g.40gb:1
+#
+# ⚠⚠ AND THE MIG SLICES ARE INTERACTIVE-ONLY ON FIR. Every MIG gres lives on the
+#    `gpubase_interac` partition (a single node, fc11020). The batch partitions
+#    (gpubase_bynode_b*) carry FULL h100:4 only. So a BATCH job must request a
+#    full H100 — rorqual's habit of submitting 40 GB MIG slices to batch does not
+#    transfer, and requesting one would sit in the queue forever.
+# ---------------------------------------------------------------------------
+FIR_GPU_FULL="${FIR_GPU_FULL:-h100:1}"                                   # batch: use this
+FIR_GPU_MIG40="${FIR_GPU_MIG40:-nvidia_h100_80gb_hbm3_3g.40gb:1}"        # interactive ONLY
+FIR_GPU_MEM="${FIR_GPU_MEM:-64000M}"
 
-# Repo-relative paths. Every script runs from the repo root.
-FIR_VENV="${FIR_VENV:-./env}"
-FIR_DATA="${FIR_DATA:-$(pwd)/data}"
-FIR_DS_ALST="${FIR_DS_ALST:-$(pwd)/temp/ds_alst}"   # DeepSpeed>=0.17, ALST only
+# ---------------------------------------------------------------------------
+# ACCOUNTS — ⚠ fir splits CPU and GPU allocations. `def-seokbum` alone is NOT a
+# valid account here; probe §9 shows only `def-seokbum_cpu` and `def-seokbum_gpu`.
+# ---------------------------------------------------------------------------
+FIR_ACCOUNT_GPU="${FIR_ACCOUNT_GPU:-def-seokbum_gpu}"
+FIR_ACCOUNT_CPU="${FIR_ACCOUNT_CPU:-def-seokbum_cpu}"
+
+# ---------------------------------------------------------------------------
+# PATHS — ⚠ DO NOT PUT ANYTHING ON /project. Probe §10: it is at
+#   938 GiB / 954 GiB (98%) and 486K / 500K files — effectively full on BOTH
+#   space and inode count. /scratch is 41 GiB / 19 TiB and is where the repo
+#   already lives. /home is only 48 GiB.
+# The HF cache alone is ~10 GB (PG-19 is ~7 GB of it) and the venv is several GB.
+# ---------------------------------------------------------------------------
+# The REPO lives on /project (code only). The VENV and the HF CACHE must live on
+# /scratch and are reached through SYMLINKS, so that every existing `./env/bin/...`
+# and `$(pwd)/data` reference in the repo keeps working untouched.
+#
+# ⚠ THE INODE BUDGET IS THE BINDING CONSTRAINT, NOT THE SPACE. /project is at
+#   486K / 500K files. A virtualenv is tens of thousands of files on its own and
+#   the HF cache is tens of thousands more; either one lands the project over its
+#   file quota, at which point EVERY write on /project fails, including jobs that
+#   have nothing to do with this repo.
+FIR_SCRATCH_ROOT="${FIR_SCRATCH_ROOT:-${SCRATCH:-/scratch/$USER}/CompAct}"
+FIR_VENV_REAL="${FIR_VENV_REAL:-$FIR_SCRATCH_ROOT/env}"
+FIR_DATA_REAL="${FIR_DATA_REAL:-$FIR_SCRATCH_ROOT/data}"
+FIR_VENV="${FIR_VENV:-./env}"                       # symlink -> $FIR_VENV_REAL
+FIR_DATA="${FIR_DATA:-$(pwd)/data}"                 # symlink -> $FIR_DATA_REAL
+FIR_DS_ALST="${FIR_DS_ALST:-$FIR_SCRATCH_ROOT/ds_alst}"   # DeepSpeed>=0.17, ALST arms only
+
+# Create the scratch targets and the symlinks. Idempotent; refuses to clobber a
+# real directory that is not already a symlink.
+fir_link_scratch() {
+    mkdir -p "$FIR_VENV_REAL" "$FIR_DATA_REAL" "$FIR_DS_ALST"
+    local pair
+    for pair in "./env:$FIR_VENV_REAL" "./data:$FIR_DATA_REAL"; do
+        local link="${pair%%:*}" target="${pair#*:}"
+        if [ -L "$link" ]; then
+            [ "$(readlink -f "$link")" = "$(readlink -f "$target")" ] || {
+                echo "FAIL: $link points at $(readlink -f "$link"), expected $target"; return 1; }
+        elif [ -e "$link" ]; then
+            echo "FAIL: $link exists and is NOT a symlink. On fir it must live on /scratch."
+            echo "      Move it aside, then re-run: mv $link ${link}.local"
+            return 1
+        else
+            ln -s "$target" "$link"
+        fi
+        echo "  $link -> $(readlink -f "$link")"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# THE PINNED STACK. ⚠ READ THIS BEFORE CHANGING A VERSION.
+#
+# Every number in CONTEXT.md was measured on the LEFT column. fir's wheelhouse
+# offers the RIGHT column, and the two are NOT interchangeable:
+#
+#   package        measured (dev box)   fir `avail_wheels`   verdict
+#   python         3.10.12              3.11.5 (module)      venv MUST be rebuilt; wheels are cp311
+#   torch          2.10.0+cu128         2.13.0               different allocator/kernels
+#   transformers   4.51.3               5.14.1               ⚠ MAJOR BUMP — see below
+#   datasets       4.5.0                5.0.0                script-dataset loading already dropped at 4.x
+#   peft           0.18.1               0.19.1
+#   accelerate     1.12.0               1.14.0
+#   deepspeed      0.16.5 (+0.17.6)     0.18.1
+#   bitsandbytes   0.49.2               0.49.2               match
+#   tensorly       0.9.0                0.9.0                match
+#   triton         3.6.0                3.6.0                match
+#   flash_attn     built from source    2.8.3 cp311 WHEEL    fir has a wheel — the dev box did not
+#
+# ⚠ transformers 5.x WILL NOT SILENTLY WORK. The fused block patches
+#   LlamaDecoderLayer / LlamaRMSNorm internals and the eleven architecture guards
+#   key on 4.51.3 structure; HyC-LoRA's port and StreamBP both import
+#   `transformers.modeling_flash_attention_utils._flash_attention_forward`. A major
+#   bump is a DIFFERENT EXPERIMENT, not an upgrade.
+#
+# PyPI is reachable from the fir LOGIN node (probe §7: HTTP 200), so the pinned
+# versions are installable. `01_setup_venv.sh` pins them and verifies.
+# ---------------------------------------------------------------------------
+FIR_PIN_TORCH="${FIR_PIN_TORCH:-2.10.0}"
+FIR_PIN_TRANSFORMERS="${FIR_PIN_TRANSFORMERS:-4.51.3}"
+FIR_PIN_DATASETS="${FIR_PIN_DATASETS:-4.5.0}"
+FIR_PIN_PEFT="${FIR_PIN_PEFT:-0.18.1}"
+FIR_PIN_ACCELERATE="${FIR_PIN_ACCELERATE:-1.12.0}"
+FIR_PIN_DEEPSPEED="${FIR_PIN_DEEPSPEED:-0.16.5}"
+FIR_PIN_DEEPSPEED_ALST="${FIR_PIN_DEEPSPEED_ALST:-0.17.6}"
+FIR_PIN_BNB="${FIR_PIN_BNB:-0.49.2}"
 
 fir_load_modules_cpu() { module load $FIR_MODULES_CPU; }
 fir_load_modules_gpu() { module load $FIR_MODULES_GPU; }
@@ -47,7 +145,7 @@ fir_load_modules_gpu() { module load $FIR_MODULES_GPU; }
 fir_export_online() {
     export HF_HOME="$FIR_DATA"
     export TORCH_HOME="$FIR_DATA"
-    export HF_HUB_DISABLE_XET=1      # xet backend has caused stalled/partial pulls
+    export HF_HUB_DISABLE_XET=1      # xet backend has produced stalled/partial pulls
     mkdir -p "$HF_HOME"
 }
 
@@ -58,60 +156,56 @@ fir_export_offline() {
     export TRANSFORMERS_OFFLINE=1
     export HF_HUB_OFFLINE=1
     # ⚠ MANDATORY AND NOT REDUNDANT: `evaluate` ignores HF_HUB_OFFLINE. Without
-    # this, evaluate.load() probes the Hub from a compute node with no route and
-    # stalls ~44 MINUTES PER SEED before timing out. This one line has cost this
-    # project more compute than any other.
+    # this, evaluate.load() probes the Hub from a node with no route and stalls
+    # ~44 MINUTES PER SEED. This single line has cost this project more compute
+    # than anything else.
     export HF_EVALUATE_OFFLINE=1
-    # Long, memory-tight runs fragment the caching allocator.
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     export PYTHONPATH="$PYTHONPATH:$(pwd)/src"
     mkdir -p "$HF_HOME"
 }
 
 # ---------------------------------------------------------------------------
-# fir_assert_env — fail on the LOGIN NODE, not 40 minutes into a GPU allocation.
-# Every check here corresponds to a failure mode that has actually happened.
+# fir_assert_env — fail on the LOGIN NODE, not 40 minutes into an allocation.
 # ---------------------------------------------------------------------------
 fir_assert_env() {
-    local want_gpu="${1:-gpu}" rc=0
-    echo "--- fir_assert_env ($want_gpu) ---"
-
-    [ -d ./src ] || { echo "FAIL: not in the repo root (no ./src)"; return 1; }
+    local want="${1:-gpu}" rc=0
+    echo "--- fir_assert_env ($want) ---"
+    [ -d ./src ] || { echo "FAIL: not in repo root (no ./src)"; return 1; }
     [ -x "$FIR_VENV/bin/python" ] || { echo "FAIL: no venv at $FIR_VENV — run 01_setup_venv.sh"; return 1; }
 
-    "$FIR_VENV/bin/python" - <<'PY' || rc=1
+    "$FIR_VENV/bin/python" - <<PY || rc=1
 import importlib, sys
-need = ["numpy", "torch", "transformers", "peft", "datasets", "accelerate",
-        "filelock", "pandas", "evaluate"]
 bad = []
-for m in need:
-    try:
-        importlib.import_module(m)
-    except Exception as e:
-        bad.append(f"{m} ({type(e).__name__})")
+for m in ["numpy","torch","transformers","peft","datasets","accelerate",
+          "filelock","pandas","evaluate"]:
+    try: importlib.import_module(m)
+    except Exception as e: bad.append(f"{m} ({type(e).__name__})")
 print("  core imports:", "OK" if not bad else "MISSING -> " + ", ".join(bad))
-if bad:
-    sys.exit(1)
-import transformers
-if transformers.__version__ != "4.51.3":
-    print(f"  ⚠ transformers is {transformers.__version__}, the measured stack is 4.51.3.")
-    print("    Every published number in this repo is on 4.51.3; a different version is a")
-    print("    DIFFERENT EXPERIMENT, not a detail. Pin it or record the change deliberately.")
+if bad: sys.exit(1)
+import transformers, datasets, torch
+pins = {"transformers": ("$FIR_PIN_TRANSFORMERS", transformers.__version__),
+        "datasets": ("$FIR_PIN_DATASETS", datasets.__version__)}
+drift = {k: v for k, v in pins.items() if v[0] and not v[1].startswith(v[0])}
+if not torch.__version__.startswith("$FIR_PIN_TORCH"):
+    drift["torch"] = ("$FIR_PIN_TORCH", torch.__version__)
+for k, (want, got) in drift.items():
+    print(f"  ⚠ {k}: pinned {want}, installed {got} — this is a DIFFERENT EXPERIMENT")
+    print(f"    from every number in CONTEXT.md. Fix the pin or record the change deliberately.")
+if drift: sys.exit(1)
+print("  pinned stack: OK")
 PY
 
-    if [ "$want_gpu" = "gpu" ]; then
+    if [ "$want" = "gpu" ]; then
         "$FIR_VENV/bin/python" - <<'PY' || rc=1
 import torch, sys
-ok = torch.cuda.is_available()
-print(f"  torch {torch.__version__} cuda={torch.version.cuda} available={ok}")
-if not ok:
-    print("  FAIL: no CUDA device visible")
-    sys.exit(1)
-print(f"  device: {torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)}")
+if not torch.cuda.is_available():
+    print("  FAIL: no CUDA device visible"); sys.exit(1)
+print(f"  torch {torch.__version__} cuda={torch.version.cuda} "
+      f"dev={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)}")
 PY
     fi
 
-    # Offline correctness: the cache must satisfy a load with the Hub blocked.
     ( fir_export_offline
       "$FIR_VENV/bin/python" - <<'PY' || exit 1
 import sys
@@ -120,7 +214,7 @@ try:
     AutoConfig.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     print("  offline model cache: OK")
 except Exception as e:
-    print(f"  FAIL offline model cache: {type(e).__name__}: {str(e)[:150]}")
+    print(f"  FAIL offline model cache: {type(e).__name__}: {str(e)[:140]}")
     print("    -> run 02_download_cache.sh on a LOGIN node first")
     sys.exit(1)
 PY

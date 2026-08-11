@@ -1,0 +1,337 @@
+############ FIR PROBE — 2026-08-11T21:42:34Z ############
+
+=================== 1. IDENTITY / SITE ===================
+hostname       : login1.int.fir.alliancecan.ca
+user           : sdmuhsin
+CC_CLUSTER     : fir
+CC_ARCH        : <unset>
+RSNT_ARCH      : avx512
+EBVERSIONGENTOO: 2023
+cpu            :  AMD EPYC 9135 16-Core Processor
+pwd            : /scratch/sdmuhsin/CompAct
+repo present   : yes
+
+=================== 2. MODULE SYSTEM + DEFAULT ENVIRONMENT ===================
+--- currently loaded (before we touch anything) ---
+
+Currently Loaded Modules:
+  1) CCconfig          4) mii/1.1.2           7) gcc/12.3    (t)  10) libfabric/1.18.0  13) openmpi/4.1.5   (m)  16) aocl-lapack/5.1      19) scipy-stack/2026a (math)
+  2) gentoo/2023 (S)   5) arrow/25.0.0  (t)   8) hwloc/2.9.1      11) pmix/4.2.4        14) flexiblas/3.3.1      17) python/3.11.5   (t)
+  3) StdEnv/2023 (S)   6) gcccore/.12.3 (H)   9) ucx/1.14.1       12) ucc/1.2.0         15) aocl-blas/5.1        18) ipykernel/2026a
+
+  Where:
+   H:     Hidden Module
+   S:     Module is Sticky, requires --force to unload or purge
+   m:     MPI implementations / Implémentations MPI
+   math:  Mathematical libraries / Bibliothèques mathématiques
+   t:     Tools for development / Outils de développement
+
+ 
+
+
+--- StdEnv versions available ---
+
+------------------------------------------------------------------------------------------------ Custom modules ------------------------------------------------------------------------------------------------
+   StdEnv/2023 (S,L,D)
+
+  Where:
+   D:  Default Module
+   L:  Module is loaded
+   S:  Module is Sticky, requires --force to unload or purge
+
+If the avail list is too long consider trying:
+
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+
+Use "module spider" to find all possible modules and extensions.
+Use "module keyword key1 key2 ..." to search for all possible modules matching any of the "keys".
+
+
+
+=================== 3. DO RORQUAL'S MODULES EXIST ON FIR? (exact names, in rorqual's order) ===================
+--- module avail gcc ---
+------------------------------------------------------------------------------------------- Cluster specific modules -------------------------------------------------------------------------------------------
+   dirac-gcc/25.0
+------------------------------------------------------------------------------------------------- Core Modules -------------------------------------------------------------------------------------------------
+   gcc/12.3 (L,t,D)    gcc/13.3 (t)    gcc/14.3 (t)
+  Where:
+   D:  Default Module
+   L:  Module is loaded
+   t:  Tools for development / Outils de développement
+If the avail list is too long consider trying:
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+Use "module spider" to find all possible modules and extensions.
+
+--- module avail arrow ---
+-------------------------------------------------------------------------------------- Compiler-dependent avx512 modules ---------------------------------------------------------------------------------------
+   arrow/14.0.0 (t)    arrow/15.0.1 (t)    arrow/17.0.0 (t)    arrow/19.0.1 (t)    arrow/22.0.0 (t)    arrow/24.0.0 (t)
+   arrow/14.0.1 (t)    arrow/16.1.0 (t)    arrow/18.1.0 (t)    arrow/21.0.0 (t)    arrow/23.0.1 (t)    arrow/25.0.0 (L,t,D)
+  Where:
+   D:  Default Module
+   L:  Module is loaded
+   t:  Tools for development / Outils de développement
+If the avail list is too long consider trying:
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+Use "module spider" to find all possible modules and extensions.
+Use "module keyword key1 key2 ..." to search for all possible modules matching any of the "keys".
+
+--- module avail scipy-stack ---
+-------------------------------------------------------------------------------------- Compiler-dependent avx512 modules ---------------------------------------------------------------------------------------
+   scipy-stack/2023b (math)    scipy-stack/2024a (math)    scipy-stack/2024b (math)    scipy-stack/2025a (math)    scipy-stack/2026a (L,math,D)
+  Where:
+   D:     Default Module
+   L:     Module is loaded
+   math:  Mathematical libraries / Bibliothèques mathématiques
+If the avail list is too long consider trying:
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+Use "module spider" to find all possible modules and extensions.
+Use "module keyword key1 key2 ..." to search for all possible modules matching any of the "keys".
+
+--- module avail cuda ---
+----------------------------------------------------------------------------------------- MPI-dependent avx512 modules -----------------------------------------------------------------------------------------
+   cuda/12.2 (t)    cuda/12.6 (t,D)    cuda/12.9 (t)    cuda/13.2 (t)
+-------------------------------------------------------------------------------------- Compiler-dependent avx512 modules ---------------------------------------------------------------------------------------
+   cuda/12.2 (t)    cuda/12.6 (t)    cuda/12.9 (t)    cuda/13.2 (t)
+  Where:
+   D:  Default Module
+   t:  Tools for development / Outils de développement
+If the avail list is too long consider trying:
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+Use "module spider" to find all possible modules and extensions.
+Use "module keyword key1 key2 ..." to search for all possible modules matching any of the "keys".
+
+--- module avail cudnn ---
+No module(s) or extension(s) found!
+If the avail list is too long consider trying:
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+Use "module spider" to find all possible modules and extensions.
+Use "module keyword key1 key2 ..." to search for all possible modules matching any of the "keys".
+
+--- module avail python ---
+-------------------------------------------------------------------------------------- Compiler-dependent avx512 modules ---------------------------------------------------------------------------------------
+   ipython-kernel/3.10        ipython-kernel/3.13          python-build-bundle/2024a    python-build-bundle/2026a (D)             python/3.12.4 (t,3.12)
+   ipython-kernel/3.11 (D)    ipython-kernel/3.14          python-build-bundle/2025a    python/3.10.13            (t,3.10)        python/3.13.2 (t,3.13)
+   ipython-kernel/3.12        python-build-bundle/2023b    python-build-bundle/2025b    python/3.11.5             (L,t,D:3.11)    python/3.14.2 (t)
+  Where:
+   Aliases:  Aliases exist: foo/1.2.3 (1.2) means that "module load foo/1.2" will load foo/1.2.3
+   D:        Default Module
+   L:        Module is loaded
+   t:        Tools for development / Outils de développement
+If the avail list is too long consider trying:
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+
+--- module avail rust ---
+-------------------------------------------------------------------------------------- Compiler-dependent avx512 modules ---------------------------------------------------------------------------------------
+   rust/1.70.0 (t)    rust/1.73.0 (t)    rust/1.76.0 (t)    rust/1.85.0 (t)    rust/1.91.0 (t)    rust/1.95.0 (t,D)
+  Where:
+   D:  Default Module
+   t:  Tools for development / Outils de développement
+If the avail list is too long consider trying:
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+Use "module spider" to find all possible modules and extensions.
+Use "module keyword key1 key2 ..." to search for all possible modules matching any of the "keys".
+
+
+=================== 4. THE RORQUAL LOAD LINE, TRIED VERBATIM ===================
+$ module load gcc arrow scipy-stack cuda cudnn
+exit=0
+
+--- what that actually loaded ---
+
+Currently Loaded Modules:
+  1) CCconfig          5) gcccore/.12.3 (H)   9) libfabric/1.18.0      13) flexiblas/3.3.1      17) python/3.11.5     (t)     21) gdrcopy/2.3.1        25) cuda/12.6       (t)
+  2) gentoo/2023 (S)   6) gcc/12.3      (t)  10) pmix/4.2.4            14) aocl-blas/5.1        18) ipykernel/2026a           22) ucx-cuda/1.14.1      26) cudnn/9.10.0.56 (math)
+  3) StdEnv/2023 (S)   7) hwloc/2.9.1        11) ucc/1.2.0             15) aocl-lapack/5.1      19) scipy-stack/2026a (math)  23) nccl/2.26.2     (t)
+  4) mii/1.1.2         8) ucx/1.14.1         12) openmpi/4.1.5    (m)  16) arrow/25.0.0    (t)  20) cudacore/.12.6.2  (H,t)   24) ucc-cuda/1.2.0
+
+  Where:
+   H:     Hidden Module
+   S:     Module is Sticky, requires --force to unload or purge
+   m:     MPI implementations / Implémentations MPI
+   math:  Mathematical libraries / Bibliothèques mathématiques
+   t:     Tools for development / Outils de développement
+
+ 
+
+
+--- python that results ---
+which python : /cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v4/Compiler/gcccore/python/3.11.5/bin/python
+python -V    : Python 3.11.5
+which python3: /cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v4/Compiler/gcccore/python/3.11.5/bin/python3
+python3 -V   : Python 3.11.5
+numpy from system site-packages (scipy-stack): 
+  numpy 2.4.2 from /cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v4/Compiler/gcccore/scipy-stack/2026a/lib/python3.11/site-packages/numpy/__init__.py
+
+=================== 5. THE DOWNLOAD-NODE LOAD LINE (no cuda/cudnn), AS IN download_cache.sh ===================
+exit=0
+
+=================== 6. ALLIANCE WHEELHOUSE — what versions can we actually install offline? ===================
+--- avail_wheels torch ---
+name    version    python    arch
+------  ---------  --------  ---------
+torch   2.13.0     cp311     x86-64-v3
+
+--- avail_wheels triton ---
+name    version    python    arch
+------  ---------  --------  -------
+triton  3.6.0      cp311     generic
+
+--- avail_wheels transformers ---
+name          version    python    arch
+------------  ---------  --------  -------
+transformers  5.14.1     py3       generic
+
+--- avail_wheels peft ---
+name    version    python    arch
+------  ---------  --------  -------
+peft    0.19.1     py3       generic
+
+--- avail_wheels datasets ---
+name      version    python    arch
+--------  ---------  --------  -------
+datasets  5.0.0      py3       generic
+
+--- avail_wheels accelerate ---
+name        version    python    arch
+----------  ---------  --------  -------
+accelerate  1.14.0     py3       generic
+
+--- avail_wheels deepspeed ---
+name       version    python    arch
+---------  ---------  --------  -------
+deepspeed  0.18.1     py3       generic
+
+--- avail_wheels bitsandbytes ---
+name          version    python    arch
+------------  ---------  --------  -------
+bitsandbytes  0.49.2     py3       generic
+
+--- avail_wheels flash_attn ---
+name        version    python    arch
+----------  ---------  --------  -------
+flash_attn  2.8.3      cp311     generic
+
+--- avail_wheels tensorly ---
+name      version    python    arch
+--------  ---------  --------  -------
+tensorly  0.9.0      py3       generic
+
+--- avail_wheels filelock ---
+name      version    python    arch
+--------  ---------  --------  -------
+filelock  3.31.1     py3       generic
+
+--- avail_wheels evaluate ---
+name      version    python    arch
+--------  ---------  --------  -------
+evaluate  0.4.6      py3       generic
+
+--- avail_wheels sentencepiece ---
+name           version    python    arch
+-------------  ---------  --------  -------
+sentencepiece  0.2.0      cp311     generic
+
+
+=================== 7. INTERNET REACHABILITY FROM THE LOGIN NODE ===================
+pypi.org             HTTP 200
+huggingface.co       HTTP 200
+
+=================== 8. GPUS AVAILABLE TO SLURM — what may follow '--gpus=' ===================
+--- gres/partitions ---
+PARTITION  NODES GRES NODELIST
+cpubase_interac      4 (null) fc[30669-30672]
+cpubase_bynode_b6     72 (null) fc[20101-20112,20554-20572,20601-20641]
+cpubase_bynode_b5    398 (null) fc[20101-20172,20201-20241,20554-20572,20601-20672,30101-30172,30201-30272,30301-30350]
+cpubase_bynode_b4    539 (null) fc[20101-20172,20201-20272,20301-20315,20554-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501]
+cpubase_bynode_b3    683 (null) fc[20101-20172,20201-20272,20301-20372,20401-20435,20554-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501-30553]
+cpubase_bynode_b2    860 (null) fc[20101-20172,20201-20272,20301-20372,20401-20472,20501-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501-30572,30601-30668]
+cpubase_bynode_b1*    860 (null) fc[20101-20172,20201-20272,20301-20372,20401-20472,20501-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501-30572,30601-30668]
+cpubase_bycore_b6     60 (null) fc[20554-20572,20601-20641]
+cpubase_bycore_b5    285 (null) fc[20554-20572,20601-20672,30101-30172,30201-30272,30301-30350]
+cpubase_bycore_b4    380 (null) fc[20554-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501]
+cpubase_bycore_b3    432 (null) fc[20554-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501-30553]
+cpubase_bycore_b2    519 (null) fc[20554-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501-30572,30601-30668]
+cpubase_bycore_b1    519 (null) fc[20554-20572,20601-20672,30101-30172,30201-30272,30301-30372,30401-30472,30501-30572,30601-30668]
+cpularge_bynode_b6      1 (null) fb21804
+cpularge_bynode_b5      2 (null) fb[21804-21805]
+cpularge_bynode_b4      4 (null) fb[21801,21804-21806]
+cpularge_bynode_b3      6 (null) fb[21801-21802,21804-21807]
+cpularge_bynode_b2      8 (null) fb[21801-21808]
+cpularge_bynode_b1      8 (null) fb[21801-21808]
+cpularge_bycore_b6      1 (null) fb21804
+cpularge_bycore_b5      2 (null) fb[21804-21805]
+cpularge_bycore_b4      3 (null) fb[21804-21806]
+cpularge_bycore_b3      4 (null) fb[21804-21807]
+cpularge_bycore_b2      5 (null) fb[21804-21808]
+cpularge_bycore_b1      5 (null) fb[21804-21808]
+gpubase_interac      1 gpu:nvidia_h100_80gb_hbm3_3g.40gb:4(S:2-3),gpu:nvidia_h100_80gb_hbm3_2g.20gb:4(S:2-3),gpu:nvidia_h100_80gb_hbm3_1g.10gb:8(S:2-3) fc11020
+gpubase_bynode_b5     29 gpu:h100:4(S:2-3) fc[10101-10120,10612-10620]
+gpubase_bynode_b5      1 gpu:h100:4(S:0) fc10611
+gpubase_bynode_b4     58 gpu:h100:4(S:2-3) fc[10101-10120,10201-10202,10204-10220,10601-10610,10612-10620]
+
+--- distinct Gres strings ---
+
+gpu:h100:4
+gpu:nvidia_h100_80gb_hbm3_1g.10gb:8
+gpu:nvidia_h100_80gb_hbm3_2g.20gb:4
+gpu:nvidia_h100_80gb_hbm3_3g.40gb:4
+
+--- does rorqual's MIG slice name exist here? ---
+h100:4(S:0)
+h100:4(S:2-3)
+h100_80gb_hbm3_1g.10gb:8(S:0)
+h100_80gb_hbm3_1g.10gb:8(S:2-3)
+h100_80gb_hbm3_2g.20gb:4(S:0)
+h100_80gb_hbm3_2g.20gb:4(S:2-3)
+h100_80gb_hbm3_3g.40gb:4(S:0)
+h100_80gb_hbm3_3g.40gb:4(S:2-3)
+(rorqual used: h100:1 and h100_3g.40gb:1)
+
+=================== 9. ACCOUNTS / ALLOCATIONS (rorqual used def-seokbum) ===================
+def-seokbum_cpu|
+def-seokbum_gpu|
+--- sshare ---
+Account                    User  RawShares  NormShares    RawUsage  EffectvUsage  FairShare 
+-------------------- ---------- ---------- ----------- ----------- ------------- ---------- 
+def-seokbum_cpu        sdmuhsin          1    0.125000           0      0.000000   0.651852 
+def-seokbum_gpu        sdmuhsin          1    0.125000         156      0.000000   0.112328 
+
+=================== 10. FILESYSTEMS AND QUOTA (venv + HF cache are large: PG-19 alone is ~7 GB) ===================
+                            Description                Space         # of files
+                  /home (user sdmuhsin)        10MiB/  48GiB        8377 / 500K
+               /scratch (user sdmuhsin)        41GiB/  19TiB          85K/1000K
+         /project (project def-seokbum)       938GiB/ 954GiB         486K/ 500K
+        /nearline (project def-seokbum)        47GiB/  19TiB          91K/1000K
+--
+On some clusters, a break down per user may be available by adding the option '--per_user'.
+HOME=/home/sdmuhsin  SCRATCH=/scratch/sdmuhsin  PROJECT=<unset>
+SLURM_TMPDIR (only set inside a job): <unset as expected on login>
+
+=================== 11. EXISTING REPO STATE ON THIS CLUSTER ===================
+./env exists     : no
+./data exists    : no
+requirements.txt : yes
+
+=================== 12. WHAT THE EXPERIMENTS NEED (so we can check feasibility against §6) ===================
+  The production runner imports, at minimum:
+    torch (CUDA), transformers==4.51.3, peft, datasets, accelerate, filelock,
+    pandas, numpy, evaluate, sentencepiece
+  Per-method extras, each needed ONLY for that method's arms:
+    qlora     -> bitsandbytes
+    zero3     -> deepspeed  (rorqual-era: any; ALST needs >=0.17)
+    alst      -> deepspeed >= 0.17  (separate side-by-side install)
+    galore    -> tensorly   (their own requirements.txt)
+    streambp  -> flash_attn (NO wheel for torch 2.10+cu128 on the dev box;
+                             had to be built from source, ~35 min)
+  If flash_attn cannot be built on fir, the streambp arms are the only ones lost.
+
+=================== PROBE COMPLETE ===================
+Send back this whole file. Nothing was installed, created, or submitted.
