@@ -134,9 +134,23 @@ stage() {   # stage <label> <import-check> -- <pip args...>
 
 # --- 3. torch FIRST. Everything else compiles/links against it, and flash-attn
 #        must see the final torch or it builds an incompatible extension.
-stage "torch ${FIR_PIN_TORCH} (cu128 index)" \
+#
+# ⚠ NO --index-url. MEASURED on fir (00c_probe_deps.sh): Alliance's pip config
+#   (/cvmfs/.../pip-x86-64-v4-gentoo2023.conf) adds `find-links` to the CVMFS
+#   wheelhouse in [install]/[download]/[wheel] with `prefer-binary = true`, so the
+#   LOCAL wheel wins no matter what index is passed — `--index-url ...cu128` and
+#   even `--isolated` both still resolved to `torch-2.10.0+computecanada`. Passing
+#   the PyTorch index is therefore pure noise; dropping it keeps the resolution
+#   honest and uses the fast local wheels.
+#
+# ⚠ RECORD THIS DEVIATION: fir gives `2.10.0+computecanada`, the dev box measured
+#   `2.10.0+cu128`. Same upstream version, DIFFERENT BUILD (Alliance compile it
+#   against their own CUDA/toolchain). Memory numbers are allocator-sensitive, so
+#   fir figures are comparable with each other but should not be quoted
+#   interchangeably with CONTEXT.md's dev-box numbers without saying so.
+stage "torch ${FIR_PIN_TORCH} (Alliance wheelhouse)" \
       "import torch;print('  torch',torch.__version__,'cuda',torch.version.cuda)" -- \
-      -q "torch==${FIR_PIN_TORCH}" --index-url https://download.pytorch.org/whl/cu128
+      -q "torch==${FIR_PIN_TORCH}"
 
 # --- 4. the pinned HF stack. Installed together so pip resolves them as a set
 #        rather than letting a later package silently upgrade an earlier one.
@@ -182,7 +196,16 @@ sys.exit(0 if ok else 1)" \
 #           undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib
 #        Try the wheel, verify by RUNNING a kernel (importing is not enough), and
 #        fall back to a source build. If both fail, ONLY the streambp arms are lost.
+#
+# ⚠ MEASURED on fir: the wheelhouse offers `flash_attn-2.8.3+torch29.computecanada`
+#   — built against TORCH 2.9, while we pin torch 2.10. That is precisely the ABI
+#   mismatch that produced `undefined symbol: _ZN3c104cuda29c10_cuda_check_...`
+#   on the dev box. So the wheel is EXPECTED to fail here and the source build is
+#   the likely path. This is why the check below RUNS a kernel instead of trusting
+#   a successful import, and why failure costs only the streambp arms.
 echo; echo "--- flash-attn (streambp arms only; failure is survivable) ---"
+echo "    NOTE: fir's wheel is built for torch 2.9 (+torch29) against our pinned 2.10 —"
+echo "    expect the wheel to fail its kernel check and the source build (~35 min) to run."
 FA_OK=false
 python -m pip install -q flash-attn --no-build-isolation 2>/dev/null && \
 python - <<'PY' && FA_OK=true

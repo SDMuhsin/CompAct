@@ -119,7 +119,23 @@ fir_link_scratch() {
 #   bitsandbytes   0.49.2               0.49.2               match
 #   tensorly       0.9.0                0.9.0                match
 #   triton         3.6.0                3.6.0                match
-#   flash_attn     built from source    2.8.3 cp311 WHEEL    fir has a wheel — the dev box did not
+#   flash_attn     built from source    2.8.3 +torch29       ⚠ built for torch 2.9, we pin 2.10
+#
+# ⚠ MEASURED 2026-08-11 (00c_probe_deps.sh), and it overturns the row above:
+#   EVERY pin resolves from Alliance's OWN wheelhouse as `<version>+computecanada`
+#   — torch 2.10.0, transformers 4.51.3, datasets 4.5.0, peft 0.18.1,
+#   accelerate 1.12.0, bitsandbytes 0.49.2, tensorly 0.9.0, evaluate 0.4.6.
+#   `avail_wheels` showed only the DEFAULT (torch 2.13.0); the older pins are there
+#   too. deepspeed 0.16.5/0.17.6 come from PyPI (no +computecanada suffix).
+#   So NO --index-url is needed anywhere, and `pip index versions` is an unreliable
+#   experimental command that reported "No matching distribution" for a package
+#   that installs fine — do not use it to conclude anything.
+#
+# ⚠ THE BUILD DIFFERS EVEN WHERE THE VERSION MATCHES: fir installs
+#   `torch 2.10.0+computecanada`, the dev box measured `2.10.0+cu128`. Same
+#   upstream version, different compile. Peak-memory numbers are allocator- and
+#   kernel-sensitive, so fir results are internally comparable but must not be
+#   quoted interchangeably with CONTEXT.md's dev-box table without saying so.
 #
 # ⚠ transformers 5.x WILL NOT SILENTLY WORK. The fused block patches
 #   LlamaDecoderLayer / LlamaRMSNorm internals and the eleven architecture guards
