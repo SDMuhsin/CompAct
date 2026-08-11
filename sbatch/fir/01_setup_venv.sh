@@ -73,15 +73,49 @@ if ! venv_is_healthy; then
     # `import datasets` dies with "ModuleNotFoundError: No module named 'numpy'"
     # (the rorqual scripts carry the same note). Our pins still shadow the system copy.
     #
-    # `virtualenv --no-download` is Alliance's recommended path and is markedly
-    # faster/more reliable here than `python -m venv`, because it seeds pip from the
-    # local wheelhouse instead of running ensurepip. Fall back if it is absent.
+    # ⚠ CREATION IS A CASCADE, because both seeders fail in different ways on fir.
+    #
+    #   1. `virtualenv --no-download` is Alliance's recommended path and is the
+    #      fastest, BUT its via_app_data seeder extracts bundled pip/setuptools
+    #      wheels that live in CVMFS, and CVMFS returns EIO on a cold/transient
+    #      read. Observed on fir 2026-08-11:
+    #        RuntimeError: failed to build image setuptools, pip because:
+    #        OSError: [Errno 5] Input/output error   (in zip_ref.extractall)
+    #      That is a filesystem hiccup, not a broken environment, so it is worth
+    #      one retry before giving up on the fast path.
+    #   2. `python -m venv` runs ensurepip instead. It is SLOW here (1-3 min on
+    #      Lustre) but it does not read CVMFS zips, so it survives exactly the
+    #      failure above. This is the path that was already working before it was
+    #      interrupted for looking hung.
+    #
+    # App-data is redirected onto /scratch so virtualenv's cache never touches
+    # /home (48 GiB) or /project (inode-bound).
+    export VIRTUALENV_OVERRIDE_APP_DATA="$FIR_SCRATCH_ROOT/.virtualenv_appdata"
+    mkdir -p "$VIRTUALENV_OVERRIDE_APP_DATA"
+
+    created=false
     if command -v virtualenv >/dev/null 2>&1; then
-        echo "    using: virtualenv --no-download --system-site-packages"
-        virtualenv --no-download --system-site-packages "$FIR_VENV_REAL" || exit 1
-    else
-        echo "    using: python -m venv --system-site-packages (virtualenv not on PATH)"
-        python -m venv --system-site-packages "$FIR_VENV_REAL" || exit 1
+        for attempt in 1 2; do
+            echo "    [$attempt/2] virtualenv --no-download --system-site-packages"
+            if virtualenv --no-download --system-site-packages "$FIR_VENV_REAL"; then
+                created=true; break
+            fi
+            echo "    virtualenv attempt $attempt failed (CVMFS EIO is the known cause)"
+            rm -rf "$FIR_VENV_REAL" "$VIRTUALENV_OVERRIDE_APP_DATA"
+            mkdir -p "$FIR_VENV_REAL" "$VIRTUALENV_OVERRIDE_APP_DATA"
+            sleep 5
+        done
+    fi
+    if ! $created; then
+        echo "    falling back to: python -m venv --system-site-packages"
+        echo "    (slower — ensurepip on Lustre — but it does not read CVMFS zips."
+        echo "     EXPECT 1-3 MINUTES OF SILENCE HERE. This is the step to let finish.)"
+        rm -rf "$FIR_VENV_REAL"; mkdir -p "$FIR_VENV_REAL"
+        python -m venv --system-site-packages "$FIR_VENV_REAL" || {
+            echo "FAIL: both virtualenv and python -m venv failed to create $FIR_VENV_REAL"
+            echo "  If this was another Errno 5, the CVMFS/Lustre mount is unhealthy right now —"
+            echo "  wait a few minutes and re-run; nothing here is corrupted."
+            exit 1; }
     fi
     venv_is_healthy || { echo "FAIL: venv still not healthy after creation"; exit 1; }
     echo "    venv created OK"
