@@ -1,0 +1,40 @@
+{
+  "seq": 1024,
+  "A_recompute_bitwise": {
+    "norm": {
+      "n_fwd_calls": 44,
+      "n_bwd_calls": 44,
+      "n_tensors_compared": 88,
+      "n_mismatched": 0,
+      "examples": []
+    },
+    "proj": {
+      "n_fwd_calls": 154,
+      "n_bwd_calls": 154,
+      "n_tensors_compared": 308,
+      "n_mismatched": 0,
+      "examples": []
+    },
+    "rope": {
+      "n_fwd_calls": 44,
+      "n_bwd_calls": 44,
+      "n_tensors_compared": 44,
+      "n_mismatched": 0,
+      "examples": []
+    },
+    "flash": {
+      "n_fwd_calls": 22,
+      "n_bwd_calls": 22,
+      "n_tensors_compared": 44,
+      "n_mismatched": 0,
+      "examples": []
+    },
+    "h2h": {
+      "n_fwd_calls": 22,
+      "n_bwd_calls": 22,
+      "n_tensors_compared": 22,
+      "n_mismatched": 0,
+      "examples": []
+    }
+  }
+}

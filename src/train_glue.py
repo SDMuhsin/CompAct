@@ -127,6 +127,20 @@ from flashffn import FlashFFNFunction
 from flashffn import FlashDReLUFFNFunction
 # Import FlashFFN v3 (LoRA-factored, quantized GLU-cache; see flashffn.py v3 section)
 from flashffn import make_v3_forward, v3_reset_counters, _V3_COUNTERS
+# Fused decoder block (llmdocs/trackers/fused_block.md): one autograd node per decoder layer.
+from flashffn import (
+    apply_flash_block,
+    apply_flash_final_norm,
+    fb_reset_counters,
+    fb_get_counters,
+    fb_adapter_families,
+)
+from hyclora.patch import (
+    HyCLoRAConfig,
+    apply_hyclora,
+    get_counters as hyclora_get_counters,
+    reset_counters as hyclora_reset_counters,
+)
 
 # Import the commonsense multiple-choice paradigm (LLM-Adapters suite):
 # registers decoder-LM *ForMultipleChoice heads, an MC collator, the 170K parser,
@@ -1021,17 +1035,89 @@ def parse_args():
     parser.add_argument("--with_tracking", action="store_true")
     parser.add_argument("--report_to", type=str, default="all")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory at the cost of slower backward pass.")
+    parser.add_argument("--cast_adapter_dtype", action="store_true",
+                        help="Cast every adapter tensor to --dtype right after adapter setup. "
+                             "PEFT's default keeps LoRA in fp32 under a bf16 base, while the "
+                             "--hyclora and --fused_block arms cast to the base dtype by "
+                             "necessity; without this flag those arms are compared at different "
+                             "adapter dtypes (fair_comparison_protocol.md §B/§E.1).")
 
     # FlashFFN Arguments
     parser.add_argument("--flash_ffn", action="store_true", help="Enable FlashFFN activation compression for SwiGLU MLP blocks. Only works with SwiGLU models (LLaMA, Mistral, etc.).")
     parser.add_argument("--flash_ffn_k_fraction", type=float, default=0.3, help="Fraction of intermediate activations to keep in FlashFFN (default: 0.3 = top 30%%).")
+    # --- HyC-LoRA (MLSys 2025) competitor arm; see llmdocs/trackers/hyclora_integration.md ---
+    parser.add_argument("--attn_implementation", type=str, default=None,
+                        choices=["eager", "sdpa", "flash_attention_2"],
+                        help="Force the attention backend. Needed for fair cross-method memory "
+                             "comparisons: OUR PORT of HyC-LoRA vendors their eager fused layer "
+                             "(models/llama/), which needs a 4D additive mask, so --hyclora "
+                             "requires eager here and any arm compared against it must also run "
+                             "eager or the comparison is confounded by sdpa's fused attention. "
+                             "This is a limitation of our port, NOT of HyC-LoRA: upstream also "
+                             "ships models/llama_flash_attn/, a FlashAttention variant that "
+                             "stores no attention map.")
+    parser.add_argument("--hyclora", action="store_true",
+                        help="Enable HyC-LoRA hybrid activation compression (competitor baseline). "
+                             "Requires PEFT LoRA on all seven projections with lora_alpha == r.")
+    parser.add_argument("--hyclora_layer_type", type=str, default="intra_inter",
+                        choices=["baseline", "intra", "intra_inter", "intra_inter_full_fuse",
+                                 "intra_inter_flash"],
+                        help="HyC-LoRA compression strategy (upstream default: intra_inter). "
+                             "`intra_inter_flash` is their FlashAttention layer; in this port it "
+                             "requires unpadded fixed-length batches (src/hyclora/patch.py "
+                             "_validate_flash_mask) and therefore cannot run a GLUE-family task.")
+    parser.add_argument("--hyclora_no_compress", action="store_true",
+                        help="HyC-LoRA verification switch: bypass every codec while keeping the "
+                             "fused dataflow. Only honoured by `intra_inter_flash`; this is the "
+                             "`hyclora_flash_nc` arm of profile_hyclora.py.")
+    parser.add_argument("--hyclora_q_bit", type=int, default=4, choices=[2, 4, 8],
+                        help="HyC-LoRA buffered-activation quantisation bits (upstream default 4).")
+    parser.add_argument("--hyclora_softmax_outlier_ratio", type=float, default=0.05,
+                        help="Attention-map outlier retention. MUST be > 0 for compressed layer "
+                             "types; at 0 grad_q/grad_k are identically zero.")
+    parser.add_argument("--hyclora_layernorm_outlier_ratio", type=float, default=0.005,
+                        help="LayerNorm/RMSNorm channel-outlier retention (upstream default 0.005).")
+    parser.add_argument("--hyclora_iteration_threshold", type=int, default=5,
+                        help="Calibration forwards before quantisation scales are frozen.")
+    parser.add_argument("--hyclora_base", type=str, default="bf16", choices=["bf16", "nf4"],
+                        help="Base-weight precision. 'nf4' reproduces upstream's QLoRA setting "
+                             "(their published numbers); 'bf16' keeps the base model at full "
+                             "precision so the only delta vs our FlashFFN arms is the activation "
+                             "compression method.")
     parser.add_argument("--flash_ffn_v3", type=str, default=None, choices=["int4", "int8", "bf16", "recompute"],
                         help="Enable FlashFFN v3 (LoRA-factored, quantized GLU-cache) with the given cache mode. "
                              "Supports PEFT-LoRA-wrapped or plain (frozen/full-FT) SwiGLU MLPs only; "
                              "errors out on DoRA/AdaLoRA/DyLoRA/VeRA. Mutually exclusive with --flash_ffn.")
+    # --- Fused decoder block (llmdocs/trackers/fused_block.md) ---
+    parser.add_argument("--fused_block", type=str, default=None,
+                        choices=["min", "attn", "glu", "full", "auto"],
+                        help="Replace every decoder layer with FusedLoRABlockFunction at the given "
+                             "`keep` level ('min' = store the block input only and recompute the "
+                             "whole block forward in backward; 'attn' = min plus FlashAttention's "
+                             "output, so the one O(S^2) term is never recomputed; 'auto' = min "
+                             "below --fused_block_auto_seq tokens and attn at/above it, resolved "
+                             "per forward and printed). Requires one of LoRA / DoRA / AdaLoRA / "
+                             "DyLoRA / VeRA on all seven projections, or plain Linear (full "
+                             "fine-tuning or frozen); adapter dropout 0 and frozen projection "
+                             "biases. FourierFT and the Spectral adapter RAISE -- there is no "
+                             "silent fallback. Padded batches go through the FlashAttention-2 "
+                             "varlen path. Mutually exclusive with --flash_ffn* and --hyclora.")
+    parser.add_argument("--fused_block_auto_seq", type=int, default=None,
+                        help="Pin the --fused_block auto policy's threshold (default 4096 tokens). "
+                             "Only meaningful with --fused_block auto; recorded in the run's "
+                             "honesty counters either way.")
+    parser.add_argument("--fused_block_final_norm", action="store_true",
+                        help="Additionally route the model-level final RMSNorm through the same "
+                             "fused kernel (`apply_flash_final_norm`); orthogonal to the block, "
+                             "reported as a separate line item in fused_block.md §2.5.")
 
     # Results CSV
     parser.add_argument("--results_csv", type=str, default=DEFAULT_RESULTS_FILE, help="Path to the results CSV file (default: ./results/mo53_glue.csv).")
+    parser.add_argument("--run_json", type=str, default=None,
+                        help="Also dump the full per-seed result dicts (including the "
+                             "training-window peak memory, train-only wall clock and the "
+                             "valid-token distribution, none of which are CSV columns) to this "
+                             "JSON path. Used by llmdocs/trackers/padded_workloads.md.")
 
     # --- Seed-split execution (transparent Mo5 sharding for large tasks) ---
     # These exist so an sbatch script can run the 5 Mo5 seeds as separate jobs
@@ -1052,6 +1138,14 @@ def parse_args():
 
     if args.flash_ffn and args.flash_ffn_v3:
         parser.error("--flash_ffn (v2) and --flash_ffn_v3 are mutually exclusive; pass at most one.")
+    if args.hyclora and (args.flash_ffn or args.flash_ffn_v3):
+        parser.error("--hyclora is a competing activation-compression method and cannot be "
+                     "combined with --flash_ffn / --flash_ffn_v3; pass at most one.")
+    if args.fused_block and (args.flash_ffn or args.flash_ffn_v3 or args.hyclora):
+        parser.error("--fused_block replaces the WHOLE decoder layer (attention + MLP) and cannot "
+                     "be combined with --flash_ffn / --flash_ffn_v3 / --hyclora; pass at most one.")
+    if args.fused_block_final_norm and not args.fused_block:
+        parser.error("--fused_block_final_norm requires --fused_block.")
 
     if args.total_batch_size:
         assert args.total_batch_size % args.per_device_train_batch_size == 0, "total_batch_size must be divisible by per_device_train_batch_size"
@@ -1328,6 +1422,50 @@ def get_memory_breakdown(model: torch.nn.Module,
         stats['allocated_memory_mib'] = mib(torch.cuda.memory_allocated(device))
     return stats
 
+def _pctl(xs: List[int], q: float) -> float:
+    """Nearest-rank percentile of an already-collected list (no numpy dtype surprises)."""
+    if not xs:
+        return float("nan")
+    s = sorted(xs)
+    i = min(len(s) - 1, max(0, int(math.ceil(q / 100.0 * len(s))) - 1))
+    return float(s[i])
+
+
+def _summarise_token_stats(per_sample: List[int], per_batch: List[int],
+                           padded_per_batch: List[int]) -> dict:
+    """Valid-vs-padded token distribution over one epoch of the TRAIN loader.
+
+    `per_sample`      valid tokens of each training example (post-truncation).
+    `per_batch`       valid tokens summed over a micro-batch.
+    `padded_per_batch` tokens the model actually ran on for that micro-batch (B x S_padded).
+    """
+    if not per_sample:
+        return {}
+    tot_valid = sum(per_batch)
+    tot_padded = sum(padded_per_batch)
+    return {
+        "n_samples": len(per_sample),
+        "n_batches": len(per_batch),
+        "sample_valid_mean": round(sum(per_sample) / len(per_sample), 3),
+        "sample_valid_p50": _pctl(per_sample, 50),
+        "sample_valid_p95": _pctl(per_sample, 95),
+        "sample_valid_max": float(max(per_sample)),
+        "batch_valid_mean": round(sum(per_batch) / len(per_batch), 3),
+        "batch_valid_p50": _pctl(per_batch, 50),
+        "batch_valid_p95": _pctl(per_batch, 95),
+        "batch_valid_max": float(max(per_batch)),
+        "batch_padded_mean": round(sum(padded_per_batch) / len(padded_per_batch), 3),
+        "batch_padded_p50": _pctl(padded_per_batch, 50),
+        "batch_padded_p95": _pctl(padded_per_batch, 95),
+        "batch_padded_max": float(max(padded_per_batch)),
+        "total_valid_tokens": tot_valid,
+        "total_padded_tokens": tot_padded,
+        # the single number the memory effect is tied to
+        "pad_waste_frac": round(1.0 - tot_valid / tot_padded, 5) if tot_padded else float("nan"),
+        "padded_over_valid": round(tot_padded / tot_valid, 4) if tot_valid else float("nan"),
+    }
+
+
 ###############################################################################
 #                             single-seed training loop                         #
 ###############################################################################
@@ -1481,10 +1619,60 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
         use_fast=not args.use_slow_tokenizer,
         trust_remote_code=args.trust_remote_code,
     )
+    # OUR PORT of HyC-LoRA vendors their EAGER fused layer (models/llama/), which needs an eager
+    # 4D additive attention mask (its fused attention adds the mask to the pre-softmax scores);
+    # under sdpa/flash the mask can arrive as None and attention would silently become non-causal.
+    # This is a constraint of the implementation we ported, NOT of HyC-LoRA the method: upstream
+    # also ships models/llama_flash_attn/, a complete FlashAttention variant of the same fused
+    # layer that stores no attention map (see llmdocs/trackers/hyclora_flash_variant.md).
+    # --hyclora_base nf4 additionally reproduces upstream's QLoRA setting, where the frozen base
+    # weights are NF4-quantised.
+    _extra_model_kwargs = {}
+    if args.attn_implementation:
+        _extra_model_kwargs["attn_implementation"] = args.attn_implementation
+    if args.hyclora:
+        # The FlashAttention layer types take the OPPOSITE mask convention: they express causality
+        # with `is_causal` and refuse an additive mask, so they must NOT be loaded eager.
+        _hyc_is_flash = args.hyclora_layer_type in ("intra_inter_flash",)
+        if _hyc_is_flash and args.attn_implementation in (None, "sdpa"):
+            _extra_model_kwargs["attn_implementation"] = "sdpa"
+            _extra_model_kwargs["torch_dtype"] = (
+                torch.bfloat16 if args.dtype == "bfloat16"
+                else torch.float16 if args.dtype == "float16" else torch.float32
+            )
+        elif args.attn_implementation not in (None, "eager"):
+            raise ValueError(
+                f"--hyclora requires eager attention in this repo: our port vendors HyC-LoRA's "
+                f"EAGER fused layer (models/llama/), which adds a 4D additive mask to the "
+                f"pre-softmax scores. This is a limitation of our port, not of HyC-LoRA -- "
+                f"upstream also ships models/llama_flash_attn/, a FlashAttention variant. "
+                f"Got --attn_implementation {args.attn_implementation}."
+            )
+        _extra_model_kwargs["attn_implementation"] = "sdpa" if _hyc_is_flash else "eager"
+        # Load directly at the run dtype. Without this, bitsandbytes records the CHECKPOINT dtype
+        # (fp16 for TinyLlama) in quant_state, so dequantize_nf4 returns fp16 while the adapters
+        # are bf16 -> "expected mat1 and mat2 to have the same dtype: Half != BFloat16" inside the
+        # fused layer. Upstream sets bnb_4bit_compute_dtype=bf16 and casts the model to bf16.
+        _extra_model_kwargs["torch_dtype"] = (
+            torch.bfloat16 if args.dtype == "bfloat16"
+            else torch.float16 if args.dtype == "float16" else torch.float32
+        )
+        if args.hyclora_base == "nf4":
+            from transformers import BitsAndBytesConfig
+            _extra_model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=False,
+                bnb_4bit_compute_dtype=(torch.bfloat16 if args.dtype == "bfloat16"
+                                        else torch.float16 if args.dtype == "float16"
+                                        else torch.float32),
+            )
+
     if is_causal_lm:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             trust_remote_code=args.trust_remote_code,
+            **_extra_model_kwargs,
         )
     elif is_multiple_choice:
         # Register the decoder-LM *ForMultipleChoice heads so the literal
@@ -1501,6 +1689,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
             config=config,
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
             trust_remote_code=args.trust_remote_code,
+            **_extra_model_kwargs,
         )
     else:
         config = AutoConfig.from_pretrained(
@@ -1515,6 +1704,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
             config=config,
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
             trust_remote_code=args.trust_remote_code,
+            **_extra_model_kwargs,
         )
     
     if (args.download_only):
@@ -1527,8 +1717,13 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     # --- Dtype, Adapter, and Device Setup ---
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16 if args.dtype == "float16" else torch.float32
     
-    # Cast model to the correct dtype before adapter init or moving to device
-    if dtype != torch.float32:
+    # Cast model to the correct dtype before adapter init or moving to device.
+    # A bitsandbytes 4-bit model (--hyclora_base nf4) rejects .to(dtype) outright -- its base
+    # weights are already NF4 with bnb_4bit_compute_dtype set at load time, so the cast is both
+    # illegal and unnecessary. Adapters are cast individually in the HyC-LoRA block below.
+    _is_4bit = getattr(model, "is_loaded_in_4bit", False) or getattr(
+        getattr(model, "config", None), "quantization_config", None) is not None
+    if dtype != torch.float32 and not _is_4bit:
         model.to(dtype=dtype)
     
     if args.adapter_method:
@@ -1792,11 +1987,32 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                 model.set_active_adapters(adapter_name)
 
                 # Cast model again after adding adapters to ensure new params are also in the correct dtype
-                if dtype != torch.float32:
+                if dtype != torch.float32 and not _is_4bit:
                     model.to(dtype=dtype)
                 logger.info(f"Successfully added and enabled {args.adapter_method.upper()} adapter for training.")
 
-    model.to(device)
+    # --- Adapter dtype, matched across arms (fair_comparison_protocol.md §B / §E.1) ---
+    # PEFT keeps LoRA/DoRA/... adapters in FP32 by default even under a bf16 base. The HyC-LoRA
+    # and fused-block arms cast them to the run dtype because their fused kernels multiply raw
+    # weights, so an uncast baseline is compared at a DIFFERENT adapter dtype -- worth 72 MiB of
+    # resident floor plus an fp32 copy of every LoRA-branch activation. `--cast_adapter_dtype`
+    # applies that same cast to EVERY arm, which is the only way the memory columns are
+    # comparable. (Leaving it off reproduces PEFT's shipped default, which is a legitimate row of
+    # its own as long as it is labelled.)
+    if args.cast_adapter_dtype:
+        _n_cast_all = 0
+        for _pname, _p in model.named_parameters():
+            if any(t in _pname for t in ("lora_", "vera_", "ia3_", "adalora_", "dylora_")) \
+                    and _p.is_floating_point() and _p.dtype != dtype:
+                _p.data = _p.data.to(dtype)
+                _n_cast_all += 1
+        logger.info(f"[seed {seed}] --cast_adapter_dtype: cast {_n_cast_all} adapter tensors "
+                    f"to {dtype}")
+
+    # A 4-bit bnb model is already materialised on its device by accelerate; re-issuing .to()
+    # is a no-op at best and can error, so skip it in that case.
+    if not _is_4bit:
+        model.to(device)
 
     # --- Multiple-choice head must always train ---
     # PEFT (task_type=None) and the custom adapters (spectral/dylora/gbvera) freeze the
@@ -1872,6 +2088,79 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
         print("=" * 80, flush=True)
         logger.info(f"[seed {seed}] FlashFFN v3 enabled: cache_mode={args.flash_ffn_v3}, "
                     f"converted {n_converted_v3} SwiGLU MLP layers")
+
+    # --- HyC-LoRA application (competitor arm; mutually exclusive with FlashFFN) ---
+    if args.hyclora:
+        # PEFT keeps adapter tensors in fp32 (autocast_adapter_dtype), but HyC-LoRA's fused
+        # Function bypasses PEFT's forward and multiplies raw weights: lora_backward computes
+        # `grad_y.to(w_dequant.dtype) @ w_lora_b.mT` with w_lora_b UNCAST, which raises on an
+        # fp32 adapter against a bf16 activation. Upstream never hit this because their runner
+        # casts the whole model after get_peft_model (run_gsm8k.py L440). We cast only the
+        # adapters, so an NF4-quantised base stays intact.
+        _n_cast = 0
+        for _pname, _p in model.named_parameters():
+            if "lora_" in _pname and _p.dtype != dtype:
+                _p.data = _p.data.to(dtype)
+                _n_cast += 1
+        if _n_cast:
+            logger.info(f"[seed {seed}] HyC-LoRA: cast {_n_cast} adapter tensors to {dtype}")
+
+        hyclora_reset_counters()
+        hyc_cfg = HyCLoRAConfig(
+            use_hyclora=True,
+            layer_type=args.hyclora_layer_type,
+            q_bit=args.hyclora_q_bit,
+            softmax_outlier_ratio=args.hyclora_softmax_outlier_ratio,
+            layernorm_outlier_ratio=args.hyclora_layernorm_outlier_ratio,
+            iteration_threshold=args.hyclora_iteration_threshold,
+            no_compress=bool(args.hyclora_no_compress),
+        )
+        n_hyc = apply_hyclora(model, hyc_cfg, verbose=True)
+        print("=" * 80, flush=True)
+        print(f"[HyC-LoRA] ENABLED | layer_type={args.hyclora_layer_type} | "
+              f"q_bit={args.hyclora_q_bit} | base={args.hyclora_base} | "
+              f"patched {n_hyc} decoder layer(s) | honesty counters reset "
+              f"(will be asserted > 0 after the first optimizer step)", flush=True)
+        print("=" * 80, flush=True)
+        logger.info(f"[seed {seed}] HyC-LoRA enabled: layer_type={args.hyclora_layer_type}, "
+                    f"q_bit={args.hyclora_q_bit}, base={args.hyclora_base}, layers={n_hyc}")
+
+    # --- Fused decoder block (mutually exclusive with FlashFFN / HyC-LoRA) ---
+    if args.fused_block:
+        # Same adapter-dtype requirement as the HyC-LoRA arm: the fused Function bypasses PEFT's
+        # forward and multiplies raw weights, so an fp32 lora_A against a bf16 activation is a
+        # hard error (raised, not silently upcast). Cast the adapters only, so a quantised base
+        # stays intact.
+        # The name filter covers every family the block now supports, not just `lora_`:
+        # VeRA's trainables are `vera_lambda_d/b` and its frozen shared projections are
+        # `vera_A/vera_B` buffers, so a `lora_`-only filter would leave the VeRA arm mixing fp32
+        # factors into a bf16 activation -- silently paying the ~1149 MiB of protocol §E.1 in the
+        # one arm nobody would think to check.
+        _n_cast = 0
+        for _pname, _p in model.named_parameters():
+            if ("lora_" in _pname or "vera_lambda" in _pname) and _p.dtype != dtype:
+                _p.data = _p.data.to(dtype)
+                _n_cast += 1
+        for _bname, _b in model.named_buffers():
+            if ("vera_A" in _bname or "vera_B" in _bname) and _b.dtype != dtype:
+                _b.data = _b.data.to(dtype)
+                _n_cast += 1
+        if _n_cast:
+            logger.info(f"[seed {seed}] fused block: cast {_n_cast} adapter tensors to {dtype}")
+        fb_reset_counters()
+        n_fb = apply_flash_block(model, keep=args.fused_block, verbose=False,
+                                 auto_seq=args.fused_block_auto_seq)
+        if args.fused_block_final_norm:
+            apply_flash_final_norm(model)
+        _fam = fb_adapter_families(model)
+        print("=" * 80, flush=True)
+        print(f"[FusedLoRABlock] ENABLED | keep={args.fused_block} | "
+              f"final_norm={bool(args.fused_block_final_norm)} | patched {n_fb} decoder "
+              f"layer(s) | adapter family per projection: {_fam} | honesty counters reset "
+              f"(asserted > 0 after the first step)", flush=True)
+        print("=" * 80, flush=True)
+        logger.info(f"[seed {seed}] fused block enabled: keep={args.fused_block}, "
+                    f"layers={n_fb}, families={_fam}")
 
     # --- Dataset Preprocessing ---
     eval_loaders = None  # set for multiple-choice (one DataLoader per eval set)
@@ -2060,6 +2349,29 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     logger.info(f"[seed {seed}] Epochs={args.num_train_epochs} | Steps={args.max_train_steps} | Total batch={args.total_batch_size}")
     
     step_times: List[float] = []
+    # --- padded-workload instrumentation (llmdocs/trackers/padded_workloads.md) ---
+    # (a) TRAINING-WINDOW peak, captured at the end of the FIRST epoch's training phase, i.e.
+    #     before any evaluation pass has run.  `peak_mem_mib` below is a WHOLE-RUN peak and is
+    #     eval-clamped (fair_comparison_protocol.md E.2); this one is not.
+    # (b) train-only wall clock per epoch, so throughput excludes eval, tokenisation and
+    #     HyC-LoRA's one-off calibration (which lives in epoch 0).
+    # (c) the valid-token distribution actually seen by the model.  Computed on the CPU tensors
+    #     the collator produced, before `.to(device)`, so it costs no CUDA sync and is identical
+    #     in every arm.
+    train_peak_alloc_mib = 0.0
+    train_peak_resv_mib = 0.0
+    train_epoch_times: List[float] = []
+    n_micro_steps = 0
+    tok_valid_per_sample: List[int] = []
+    tok_valid_per_batch: List[int] = []
+    tok_padded_per_batch: List[int] = []
+    # (d) mean training loss per epoch. Accumulated ON DEVICE and read once per epoch, so it
+    #     costs no per-step CUDA sync. This is the direct test of the fused block's claimed
+    #     padding-invariance: with identical data order, an arm whose answer is a function of the
+    #     VALID tokens only must produce the same loss trace under `--pad_to_max_length` as under
+    #     dynamic padding; an arm that is not padding-invariant must not.
+    epoch_loss_means: List[float] = []
+    first_micro_loss = None
     mem_stats_after_first_step = {}
     best_metric_val = float("-inf")
     best_metric_dict: Dict[str, float] = {}
@@ -2069,7 +2381,23 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     # --- Training Loop ---
     for epoch in range(args.num_train_epochs):
         model.train()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        _epoch_train_start = time.perf_counter()
+        _epoch_loss_sum = None
+        _epoch_loss_n = 0
         for step, batch in enumerate(train_loader):
+
+            # Valid-token bookkeeping (epoch 0 only; CPU tensors, no CUDA sync).
+            if epoch == 0:
+                _am = batch.get("attention_mask")
+                if _am is not None:
+                    _am2 = _am.reshape(-1, _am.shape[-1])
+                    _v = _am2.sum(dim=-1)
+                    tok_valid_per_sample.extend(int(x) for x in _v.tolist())
+                    tok_valid_per_batch.append(int(_v.sum()))
+                    tok_padded_per_batch.append(int(_am2.numel()))
+            n_micro_steps += 1
 
             # Move batch to device and cast to appropriate dtype
             batch = {
@@ -2081,7 +2409,16 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
 
             outputs = model(**batch)
             loss = outputs.loss
-            
+
+            _ld = loss.detach().float()
+            _epoch_loss_sum = _ld if _epoch_loss_sum is None else _epoch_loss_sum + _ld
+            _epoch_loss_n += 1
+            if epoch == 0 and step == 0 and first_micro_loss is None:
+                # The FIRST micro-batch, before any optimizer update: a pure forward comparison
+                # on identical (untrained) weights. This is the padding-invariance test with the
+                # trajectory divergence taken out of it. One .item() on step 0 only.
+                first_micro_loss = float(_ld.item())
+
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
             
@@ -2120,6 +2457,37 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
                     print(f"[FlashFFN v3] honesty check passed after first optimizer step: "
                           f"forward={_v3_fwd}, backward={_v3_bwd}", flush=True)
 
+                if completed_steps == 1 and args.hyclora:
+                    _hc = hyclora_get_counters()
+                    if _hc["forward"] == 0 or _hc["backward"] == 0:
+                        raise RuntimeError(
+                            f"HyC-LoRA honesty check FAILED after the first optimizer step: "
+                            f"forward={_hc['forward']}, backward={_hc['backward']} (both must be > 0). "
+                            f"The HyC-LoRA fused path did NOT run despite --hyclora."
+                        )
+                    print(f"[HyC-LoRA] honesty check passed after first optimizer step: "
+                          f"forward={_hc['forward']}, backward={_hc['backward']}, "
+                          f"layers={_hc['patched_layers']}", flush=True)
+
+                if completed_steps == 1 and args.fused_block:
+                    _fb = fb_get_counters()
+                    # `attn` and `auto`-resolved-to-`attn` still recompute the block; what they do
+                    # NOT do is re-run the O(S^2) attention forward, which `flash_recompute`
+                    # counts separately.
+                    _need_rec = args.fused_block in ("min", "attn", "auto")
+                    if (_fb["forward"] == 0 or _fb["backward"] == 0
+                            or (_need_rec and _fb["recompute"] == 0)):
+                        raise RuntimeError(
+                            f"Fused-block honesty check FAILED after the first optimizer step: "
+                            f"{_fb} (forward/backward, and recompute at keep='min', must all be "
+                            f"> 0). The fused block did NOT run despite "
+                            f"--fused_block={args.fused_block}."
+                        )
+                    print(f"[FusedLoRABlock] honesty check passed after first optimizer step: "
+                          f"forward={_fb['forward']}, backward={_fb['backward']}, "
+                          f"recompute={_fb['recompute']}, layers={_fb['patched_layers']}",
+                          flush=True)
+
                 if completed_steps == 1 and device.type == "cuda":
                     torch.cuda.empty_cache()
                     mem_stats_after_first_step = get_memory_breakdown(model, optimizer, device)
@@ -2133,7 +2501,21 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
             
             if completed_steps >= args.max_train_steps:
                 break
-        
+
+        # --- End of this epoch's TRAINING phase: capture the un-eval-clamped peak + wall clock ---
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        train_epoch_times.append(time.perf_counter() - _epoch_train_start)
+        epoch_loss_means.append(
+            float(_epoch_loss_sum.item() / _epoch_loss_n) if _epoch_loss_n else float("nan"))
+        if device.type == "cuda" and epoch == 0:
+            train_peak_alloc_mib = mib(torch.cuda.max_memory_allocated(device))
+            train_peak_resv_mib = mib(torch.cuda.max_memory_reserved(device))
+            logger.info(
+                f"[seed {seed}] TRAINING-WINDOW peak (epoch 0, before any eval): "
+                f"alloc={train_peak_alloc_mib:.2f} MiB | reserved={train_peak_resv_mib:.2f} MiB"
+            )
+
         # --- Evaluation ---
         model.eval()
         if is_multiple_choice:
@@ -2195,6 +2577,30 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
             break
             
     # --- Final Benchmarks ---
+    # Honesty counters + live adapter-dtype receipt, read off the model BEFORE it is deleted.
+    honesty_counters: Dict[str, Dict] = {}
+    if args.fused_block:
+        honesty_counters["fused_block"] = dict(fb_get_counters())
+        # The adapter family read off the LIVE projections, so a row can never claim a family
+        # its modules do not structurally have.
+        honesty_counters["fused_block_families"] = fb_adapter_families(model)
+        # Which `keep` level every shape in this run actually got, so an `auto` run's memory
+        # number can never be quoted without the policy that produced it.
+        from flashffn import fb_policy_report as _fb_pol
+        honesty_counters["fused_block_policy"] = _fb_pol()
+    if args.hyclora:
+        honesty_counters["hyclora"] = dict(hyclora_get_counters())
+    if args.flash_ffn_v3:
+        honesty_counters["flash_ffn_v3"] = dict(_V3_COUNTERS)
+    dtype_receipt: Dict[str, Dict[str, float]] = {}
+    for _n, _p in model.named_parameters():
+        _k = f"{'adapter' if _p.requires_grad else 'base'}/{_p.dtype}"
+        _e = dtype_receipt.setdefault(_k, {"tensors": 0, "mib": 0.0})
+        _e["tensors"] += 1
+        _e["mib"] += mib(_p.numel() * _p.element_size())
+    for _e in dtype_receipt.values():
+        _e["mib"] = round(_e["mib"], 2)
+
     peak_mem_mib = mem_stats_after_first_step.get('peak_memory_mib', 0)
     if device.type == "cuda":
         final_peak_memory_mib = mib(torch.cuda.max_memory_allocated(device))
@@ -2221,6 +2627,18 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
         "theoretical_mem_mib": theoretical_mem_mib,
         "avg_step_time": avg_step_time,
         "std_step_time": std_step_time,
+        # --- padded-workload instrumentation (not CSV columns) ---
+        "train_peak_alloc_mib": train_peak_alloc_mib,
+        "train_peak_resv_mib": train_peak_resv_mib,
+        "train_epoch_times_sec": [round(t, 4) for t in train_epoch_times],
+        "epoch_train_loss_mean": epoch_loss_means,
+        "first_micro_loss": first_micro_loss,
+        "n_micro_steps": n_micro_steps,
+        "n_opt_steps": completed_steps,
+        "honesty_counters": honesty_counters,
+        "dtype_receipt": dtype_receipt,
+        "token_stats": _summarise_token_stats(
+            tok_valid_per_sample, tok_valid_per_batch, tok_padded_per_batch),
     }
     if is_multiple_choice:
         # One training run produced an accuracy per eval set; carried through the
@@ -2419,7 +2837,15 @@ def build_result_row(args, per_seed_results: List[Dict], total_training_time_sec
         "spectral_learn_scaling": args.spectral_learn_scaling if args.adapter_method == 'spectral' else 'N/A',
         "per_layer_opt": args.per_layer_opt,
         "gradient_checkpointing": args.gradient_checkpointing,
-        "flash_ffn": (f"v3:{args.flash_ffn_v3}" if getattr(args, "flash_ffn_v3", None) else args.flash_ffn),
+        "flash_ffn": (
+            f"hyclora:{args.hyclora_layer_type}:{args.hyclora_q_bit}:{args.hyclora_base}"
+            if getattr(args, "hyclora", False)
+            else f"fused_block:{args.fused_block}"
+            f"{'+fnorm' if getattr(args, 'fused_block_final_norm', False) else ''}"
+            if getattr(args, "fused_block", None)
+            else f"v3:{args.flash_ffn_v3}" if getattr(args, "flash_ffn_v3", None)
+            else args.flash_ffn
+        ),
         "flash_ffn_k_fraction": args.flash_ffn_k_fraction if args.flash_ffn else 'N/A',
         "accuracy": median_metrics.get("accuracy", np.nan),
         "f1": median_metrics.get("f1", np.nan),
@@ -2524,6 +2950,21 @@ def main():
     total_training_time_sec = time.time() - training_start_time
     for all_columns, comb_cols, result_row in build_result_rows(args, all_results, total_training_time_sec, seeds):
         write_result_row(args.results_csv, all_columns, comb_cols, result_row)
+
+    if args.run_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.run_json)) or ".", exist_ok=True)
+        payload = {
+            "name": args.name,
+            "argv": sys.argv,
+            "args": {k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
+                     for k, v in vars(args).items()},
+            "seeds": seeds,
+            "total_training_time_sec": total_training_time_sec,
+            "per_seed": all_results,
+        }
+        with open(args.run_json, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        logger.info(f"Wrote per-seed instrumentation JSON -> {args.run_json}")
 
 
 if __name__ == "__main__":

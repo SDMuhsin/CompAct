@@ -18,3 +18,4 @@ huggingface_hub[hf_xet]
 sentencepiece
 scikit-learn
 protobuf
+einops  # HyC-LoRA compute_utils (lazy; only for pad_input/unpad_input, unused by fused path)

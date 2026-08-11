@@ -103,11 +103,22 @@ techniques=(
 # can trim to one mode (V3_MODES="int4" ./sbatch/run_commonsense.sh) or set
 # V3_MODES="" to disable all FlashFFNV3 arms. NOTE: "-" (not ":-") expansion so
 # an explicitly empty V3_MODES="" disables v3 instead of re-enabling the default.
-# DEFAULT = recompute: exact gradients (cos>=0.9999), lightest memory, and the actual
-# novel win (factored adapter math, NO merged-weight storage). int4 is an OPT-IN speed
-# knob (skips the backward recompute GEMMs via generic activation quantization, ~tiny
-# grad error) — it does NOT add memory savings over recompute. Add it via
-# V3_MODES="recompute int4" if you want the speed arm too.
+# DEFAULT = recompute: bf16-rounding-exact gradients (median LoRA-grad cos 0.99996),
+# lightest of the v2/v3/PEFT arms, and the actual novel win (factored adapter math, NO
+# merged-weight storage). int4 is an OPT-IN speed knob (skips the backward recompute
+# GEMMs via generic activation quantization, ~tiny grad error) — it does NOT add memory
+# savings over recompute. Add it via V3_MODES="recompute int4" if you want the speed arm.
+#
+# CORRECTION 2026-08-02 (llmdocs/trackers/boring_baseline_frontier.md §4): this comment
+# previously read "exact gradients (cos>=0.9999), lightest memory". Both are too strong.
+# (a) recompute's adapter grads deviate rel-L2 median 9.840e-03 / max 1.038e-01 from an
+#     uncompressed baseline; every gradient-checkpointing variant measures 0.000e+00.
+#     Cosine >= 0.9999 is bf16-rounding exactness, not bitwise exactness.
+# (b) "lightest memory" holds only within this sweep's arms: a one-line
+#     torch.utils.checkpoint(layer.mlp) matches recompute's peak to 0.08% (5012.28 vs
+#     5016.40 MiB), and full gradient checkpointing is 35% lighter (3256.93 MiB) and
+#     bitwise exact. v3's measurable edge at its memory point is 7.25% throughput.
+# Behaviour of these scripts is unchanged; only the claim in this comment is corrected.
 V3_MODES="${V3_MODES-recompute}"
 # v3-capable techniques = the same 6 effective-weight methods as the v2 list.
 V3_TECHNIQUES=(base lora dora adalora dylora vera)

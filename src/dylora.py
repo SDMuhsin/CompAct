@@ -135,6 +135,13 @@ class DyLoRAModel(nn.Module):
     def forward(self, **kwargs):
         return self.model(**kwargs)
 
+    @property
+    def config(self):
+        """Forward the wrapped model's config. PEFT's own wrappers expose one, and every harness
+        in this repo reads `model.config.vocab_size` / `use_cache`; without this the DyLoRA arm is
+        the only family that cannot be driven through the shared measurement code."""
+        return self.model.config
+
     def print_trainable_parameters(self):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())

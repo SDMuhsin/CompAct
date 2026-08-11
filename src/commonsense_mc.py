@@ -314,6 +314,18 @@ def load_commonsense_train(tokenizer, max_length: int, n_samples=None, shuffle_s
 COMMONSENSE_EVAL_SETS = ["boolq", "piqa", "siqa", "hellaswag",
                          "winogrande", "arc_e", "arc_c", "obqa"]
 
+# MMLU is available through the SAME multiple-choice schema but is NOT part of the LLM-Adapters
+# commonsense table, so it is kept out of `COMMONSENSE_EVAL_SETS` (which defines that table's 8 rows)
+# and requested explicitly.
+#
+# ⚠ READ BEFORE PUTTING AN "MMLU" NUMBER IN A PAPER. In the literature MMLU is reported **5-shot**
+# with a prompted base model. Evaluated here it is **0-shot through a trained MC head**, after
+# fine-tuning on Commonsense-170K, which contains no MMLU-style academic material. That is a
+# different quantity and will not match published MMLU scores. It is a legitimate *relative*
+# comparison across our methods — every arm sees the identical protocol — but the column must be
+# labelled `mmlu_0shot_mc` and never plain "MMLU".
+EXTRA_MC_EVAL_SETS = ["mmlu"]
+
 
 def _extract_eval_columns(name: str) -> Dict[str, list]:
     """Load one native eval dataset (correct split) and map it to columns
@@ -365,6 +377,18 @@ def _extract_eval_columns(name: str) -> Dict[str, list]:
             ctx.append(ex["question_stem"])
             chs.append(list(texts))
             lab.append(labels.index(ak))
+    elif name == "mmlu":
+        # `cais/mmlu` config "all", split "test": 14042 rows, exactly 4 choices each, `answer` is
+        # already a 0-3 int (verified 2026-08-11), so no answerKey->index mapping is needed.
+        # The subject is prepended to the stem so the MC head sees the same "topic: question" shape
+        # the 170K stems use; it is NOT few-shot (see the warning at EXTRA_MC_EVAL_SETS).
+        d = load_dataset("cais/mmlu", "all")["test"]
+        ctx = [f'{ex["subject"].replace("_", " ")}: {ex["question"]}' for ex in d]
+        chs = [list(ex["choices"]) for ex in d]
+        lab = [int(ex["answer"]) for ex in d]
+        bad = [i for i, c in enumerate(chs) if len(c) != 4]
+        if bad:
+            raise ValueError(f"mmlu: {len(bad)} rows do not have 4 choices (first: {bad[0]})")
     else:
         raise ValueError(f"Unknown commonsense eval set: {name!r}")
     return {"context": ctx, "choices": chs, "label": lab}

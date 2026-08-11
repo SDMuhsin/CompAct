@@ -44,6 +44,11 @@ from huggingface_hub import snapshot_download
 models = [
     'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
     'huggyllama/llama-7b',
+    # Second decoder family for the memory/throughput sweep. Qwen2 is a genuinely different
+    # shape from TinyLlama -- 28 layers, GQA 12:2, FFN ratio 5.83x against TinyLlama's 2.75x --
+    # and it carries attention-projection biases, which is the case the fused block's bias fix
+    # unlocked. SiLU, no sliding window, attention_dropout 0, so all eleven guards are satisfied.
+    'Qwen/Qwen2-1.5B',
 ]
 
 for model_name in models:
