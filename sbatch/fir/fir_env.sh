@@ -176,6 +176,11 @@ fir_export_offline() {
     # ~44 MINUTES PER SEED. This single line has cost this project more compute
     # than anything else.
     export HF_EVALUATE_OFFLINE=1
+    # torch >= 2.9 renamed this and warns on every process start; older torch only
+    # knows the old name. Set BOTH so the setting actually applies either way and
+    # the logs stay clean. (fir warns: "PYTORCH_CUDA_ALLOC_CONF is deprecated, use
+    # PYTORCH_ALLOC_CONF instead".)
+    export PYTORCH_ALLOC_CONF=expandable_segments:True
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     export PYTHONPATH="$PYTHONPATH:$(pwd)/src"
     mkdir -p "$HF_HOME"
@@ -196,7 +201,12 @@ bad = []
 for m in ["numpy","torch","transformers","peft","datasets","accelerate",
           "filelock","pandas","evaluate"]:
     try: importlib.import_module(m)
-    except Exception as e: bad.append(f"{m} ({type(e).__name__})")
+    except Exception as e:
+        # ⚠ PRINT THE MESSAGE, NOT JUST THE TYPE. "peft (RuntimeError)" is
+        # unactionable and cost a round trip on fir 2026-08-11; the message names
+        # the actual conflict (usually a version mismatch after a silent downgrade).
+        bad.append(m)
+        print(f"  IMPORT FAILED {m}: {type(e).__name__}: {str(e)[:400]}")
 print("  core imports:", "OK" if not bad else "MISSING -> " + ", ".join(bad))
 if bad: sys.exit(1)
 import transformers, datasets, torch

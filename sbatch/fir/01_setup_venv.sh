@@ -125,11 +125,32 @@ echo "venv python: $(python -V 2>&1) at $(command -v python)"
 
 python -m pip install -q --upgrade pip setuptools wheel packaging ninja || exit 1
 
+# ⚠ THE TORCH GUARD. A pip stage can silently DOWNGRADE torch by pulling a
+# dependency that pins an older one — which is exactly what happened on fir
+# 2026-08-11: flash-attn's Alliance wheel is `2.8.3+torch29.computecanada`, it
+# requires torch 2.9.x, and installing it without --no-deps took torch from the
+# pinned 2.10.0 down to 2.9.1. Every earlier stage had already verified and
+# passed, so nothing complained until the preflight job failed on a compute node.
+# Re-assert the pin after EVERY stage so the culprit is named at the moment it acts.
+assert_torch_pin() {
+    local where="$1"
+    python - <<PY || { echo "FAIL: torch pin broken by: $where"; exit 1; }
+import sys, torch
+want, got = "${FIR_PIN_TORCH}", torch.__version__
+if not got.startswith(want):
+    print(f"  ⚠⚠ TORCH DOWNGRADED to {got} (pinned {want}) by: $where")
+    print( "     Some dependency pinned an older torch. Re-install that package with")
+    print( "     --no-deps, or constrain it. Continuing would measure a DIFFERENT stack.")
+    sys.exit(1)
+PY
+}
+
 stage() {   # stage <label> <import-check> -- <pip args...>
     local label="$1" check="$2"; shift 3
     echo; echo "--- $label ---"
     python -m pip install "$@" || { echo "FAIL: pip install for $label"; exit 1; }
     python -c "$check" || { echo "FAIL: post-install verification for $label"; exit 1; }
+    assert_torch_pin "$label"
 }
 
 # --- 3. torch FIRST. Everything else compiles/links against it, and flash-attn
@@ -207,25 +228,55 @@ echo; echo "--- flash-attn (streambp arms only; failure is survivable) ---"
 echo "    NOTE: fir's wheel is built for torch 2.9 (+torch29) against our pinned 2.10 —"
 echo "    expect the wheel to fail its kernel check and the source build (~35 min) to run."
 FA_OK=false
-python -m pip install -q flash-attn --no-build-isolation 2>/dev/null && \
-python - <<'PY' && FA_OK=true
-import torch
-from flash_attn import flash_attn_func
-q,k,v = [torch.randn(1,64,4,64,device='cuda',dtype=torch.bfloat16,requires_grad=True) for _ in range(3)]
-o = flash_attn_func(q,k,v,causal=True); o.sum().backward()
-import flash_attn; print('  flash_attn', flash_attn.__version__, 'fwd+bwd OK on this GPU')
+# ⚠ --no-deps IS MANDATORY HERE. fir's wheel is `flash_attn-2.8.3+torch29...`,
+# which REQUIRES torch 2.9.x; without --no-deps pip happily downgrades our pinned
+# torch 2.10.0 to satisfy it and every other package then sits on the wrong ABI.
+# Observed on fir 2026-08-11: torch silently became 2.9.1 and peft/evaluate stopped
+# importing. With --no-deps the wheel either works against our torch or fails its
+# kernel check below and is removed — it can no longer damage the rest of the stack.
+# ⚠ THE CHECK MUST NOT NEED A GPU. This script runs on a LOGIN NODE, which has
+# none, so a `device='cuda'` test would fail for every candidate — condemning a
+# perfectly good wheel and then burning 35 minutes on a source build whose check
+# fails the same way. Importing the extension is the right test anyway: the ABI
+# break we are guarding against (`undefined symbol: _ZN3c104cuda29c10_cuda_...`)
+# surfaces when the .so is LOADED, not when a kernel runs. The actual kernel is
+# exercised later by 03_preflight.sh, on a node that has a GPU.
+fa_check() {
+    python - <<'PY'
+import sys
+try:
+    import flash_attn
+    import flash_attn_2_cuda            # loads the compiled extension -> resolves symbols
+    import torch
+    print(f"  flash_attn {flash_attn.__version__} imports cleanly against torch {torch.__version__}")
+except Exception as e:
+    print(f"  flash_attn unusable: {type(e).__name__}: {str(e)[:200]}")
+    sys.exit(1)
 PY
-if ! $FA_OK; then
-    echo "  wheel unusable; attempting source build (~35 min, needs nvcc from the cuda module)"
+}
+
+if python -m pip install -q --no-deps flash-attn --no-build-isolation 2>&1 | tail -3; then :; fi
+if fa_check; then
+    FA_OK=true
+else
+    echo "  wheel unusable (expected: it is built for torch 2.9). Removing it and building from source."
+    python -m pip uninstall -y -q flash-attn 2>/dev/null
+    echo "  source build: ~35 min, needs nvcc from the cuda module. MAX_JOBS=8."
     export MAX_JOBS=8 FLASH_ATTENTION_FORCE_BUILD=TRUE
-    python -m pip install --no-build-isolation flash-attn && \
-    python -c "
-import torch
-from flash_attn import flash_attn_func
-q,k,v=[torch.randn(1,64,4,64,device='cuda',dtype=torch.bfloat16) for _ in range(3)]
-flash_attn_func(q,k,v,causal=True); print('  source-built flash_attn OK')" && FA_OK=true
+    # --no-deps again: the sdist declares a torch requirement too, and satisfying
+    # it would undo the pin exactly as the wheel did.
+    if python -m pip install --no-deps --no-build-isolation flash-attn && fa_check; then
+        FA_OK=true
+    fi
 fi
-$FA_OK || echo "  ⚠ flash-attn UNAVAILABLE -> streambp arms disabled. Every other method is fine."
+if ! $FA_OK; then
+    # Leave NOTHING broken behind: a half-installed flash_attn makes `import
+    # streambp` fail in a confusing way at job time instead of the arm simply
+    # being absent.
+    python -m pip uninstall -y -q flash-attn 2>/dev/null
+    echo "  ⚠ flash-attn UNAVAILABLE -> streambp arms disabled. Every other method is fine."
+fi
+assert_torch_pin "flash-attn stage"
 
 # --- 8. final gate
 echo; echo "############ verifying ############"
