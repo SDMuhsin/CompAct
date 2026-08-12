@@ -807,7 +807,10 @@ def build_alst_model(arm, cfg, device, use_cache=False):
         raise RuntimeError(
             f"ALST needs DeepSpeed >= 0.17 for `runtime.sequence_parallel.ulysses_sp.TiledMLP`, but "
             f"the loaded deepspeed is {_ds.__version__} from {os.path.dirname(_ds.__file__)}. "
-            f"Re-run with:  PYTHONPATH=temp/ds_alst python src/profile_unsloth.py --arm {arm} ... "
+            f"Re-run with:  PYTHONPATH=temp/ds_alst:$PYTHONPATH python src/profile_unsloth.py "
+            f"--arm {arm} ...   (⚠ APPEND, never assign: on Alliance clusters numpy comes from the "
+            f"scipy-stack module via PYTHONPATH, so `PYTHONPATH=temp/ds_alst` deletes numpy and "
+            f"deepspeed dies with ModuleNotFoundError: No module named 'numpy') "
             f"(the env's 0.16.5 is kept deliberately so the measured `zero3_*` rows stay valid).")
     _tc = os.path.join(root, "temp", "arctic", "arctic_training", "model", "tiled_compute.py")
     _spec = importlib.util.spec_from_file_location("_alst_tiled_compute", _tc)

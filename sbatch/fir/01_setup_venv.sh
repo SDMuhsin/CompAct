@@ -28,7 +28,14 @@ cd "$(dirname "$0")/../.." || exit 1          # repo root
 source sbatch/fir/fir_env.sh
 
 FRESH=false
-[ "${1:-}" = "--fresh" ] && FRESH=true
+BUILD_FA=false
+for a in "$@"; do
+    case "$a" in
+        --fresh)            FRESH=true ;;
+        --with-flash-attn)  BUILD_FA=true ;;   # attempt the ~35 min source build
+        *) echo "unknown option: $a"; echo "usage: $0 [--fresh] [--with-flash-attn]"; exit 1 ;;
+    esac
+done
 
 echo "############ fir venv setup — $(date -u +%FT%TZ) ############"
 echo "repo (on /project): $(pwd)"
@@ -198,10 +205,17 @@ stage "tensorly (galore arms — their own requirements.txt)" \
 # --- 6. DeepSpeed >= 0.17 SIDE-BY-SIDE for ALST only. Installed to a separate
 #        prefix and put on PYTHONPATH for ALST arms alone, because upgrading in
 #        place would silently change every zero3 number.
+#
+# ⚠⚠ ALWAYS APPEND TO PYTHONPATH, NEVER ASSIGN IT. On fir, numpy is supplied by the
+#    `scipy-stack` MODULE, which puts it on PYTHONPATH — so `PYTHONPATH=/some/dir`
+#    silently removes numpy from the interpreter and deepspeed dies with
+#    `ModuleNotFoundError: No module named 'numpy'` from `deepspeed/utils/timer.py`.
+#    Observed on fir 2026-08-11. This applies to the ALST ARM AT RUN TIME too:
+#    use `PYTHONPATH=$FIR_DS_ALST:$PYTHONPATH`, not `PYTHONPATH=$FIR_DS_ALST`.
 echo; echo "--- deepspeed ${FIR_PIN_DEEPSPEED_ALST} side-by-side -> $FIR_DS_ALST ---"
 DS_BUILD_OPS=0 python -m pip install -q --no-deps --target "$FIR_DS_ALST" \
     "deepspeed==${FIR_PIN_DEEPSPEED_ALST}" \
-  && PYTHONPATH="$FIR_DS_ALST" python -c "
+  && PYTHONPATH="$FIR_DS_ALST:$PYTHONPATH" python -c "
 import importlib.util as u, sys
 sys.path.insert(0,'$FIR_DS_ALST')
 ok = u.find_spec('deepspeed.runtime.sequence_parallel') is not None
@@ -258,16 +272,25 @@ PY
 if python -m pip install -q --no-deps flash-attn --no-build-isolation 2>&1 | tail -3; then :; fi
 if fa_check; then
     FA_OK=true
-else
-    echo "  wheel unusable (expected: it is built for torch 2.9). Removing it and building from source."
+elif $BUILD_FA; then
+    echo "  wheel unusable (expected: built for torch 2.9). Removing it and building from SOURCE."
     python -m pip uninstall -y -q flash-attn 2>/dev/null
     echo "  source build: ~35 min, needs nvcc from the cuda module. MAX_JOBS=8."
     export MAX_JOBS=8 FLASH_ATTENTION_FORCE_BUILD=TRUE
-    # --no-deps again: the sdist declares a torch requirement too, and satisfying
-    # it would undo the pin exactly as the wheel did.
-    if python -m pip install --no-deps --no-build-isolation flash-attn && fa_check; then
+    # ⚠ `--no-binary flash-attn` IS THE LOAD-BEARING FLAG. Without it pip finds the
+    #   SAME broken wheel in Alliance's find-links wheelhouse and reinstalls it —
+    #   observed on fir 2026-08-11, where the "source build" printed
+    #   "Processing /cvmfs/.../flash_attn-2.8.3+torch29...whl" and produced the
+    #   identical undefined-symbol failure in seconds. FLASH_ATTENTION_FORCE_BUILD
+    #   never applies because pip never reaches an sdist.
+    # --no-deps again: the sdist declares a torch requirement that would undo the pin.
+    if python -m pip install --no-deps --no-build-isolation --no-binary flash-attn flash-attn \
+       && fa_check; then
         FA_OK=true
     fi
+else
+    echo "  wheel unusable (expected: built for torch 2.9)."
+    echo "  SKIPPING the ~35 min source build. Re-run with --with-flash-attn to attempt it."
 fi
 if ! $FA_OK; then
     # Leave NOTHING broken behind: a half-installed flash_attn makes `import
