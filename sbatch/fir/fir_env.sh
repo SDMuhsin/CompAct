@@ -77,16 +77,38 @@ FIR_ACCOUNT_CPU="${FIR_ACCOUNT_CPU:-def-seokbum_cpu}"
 FIR_SCRATCH_ROOT="${FIR_SCRATCH_ROOT:-${SCRATCH:-/scratch/$USER}/CompAct}"
 FIR_VENV_REAL="${FIR_VENV_REAL:-$FIR_SCRATCH_ROOT/env}"
 FIR_DATA_REAL="${FIR_DATA_REAL:-$FIR_SCRATCH_ROOT/data}"
+FIR_TEMP_REAL="${FIR_TEMP_REAL:-$FIR_SCRATCH_ROOT/temp}"
 FIR_VENV="${FIR_VENV:-./env}"                       # symlink -> $FIR_VENV_REAL
 FIR_DATA="${FIR_DATA:-$(pwd)/data}"                 # symlink -> $FIR_DATA_REAL
-FIR_DS_ALST="${FIR_DS_ALST:-$FIR_SCRATCH_ROOT/ds_alst}"   # DeepSpeed>=0.17, ALST arms only
+FIR_TEMP="${FIR_TEMP:-$(pwd)/temp}"                 # symlink -> $FIR_TEMP_REAL
+
+# ⚠ `temp/` IS NOT SCRATCH SPACE — IT IS A CODE DEPENDENCY, AND IT IS GITIGNORED.
+#   `.gitignore:8` excludes it, so neither git nor a repo-only rsync carries it, and
+#   fir got a repo whose baseline arms could not import their own methods. Every
+#   published baseline of the §16 campaign is a CLONE living there, reached by an
+#   explicit `sys.path.insert` at a HARDCODED relative path:
+#       temp/lomo              profile_hyclora.py:671   (lomo, adalomo)
+#       temp/galore            profile_hyclora.py:724   (galore)
+#       temp/minis             profile_hyclora.py:631   (mini-sequence)
+#       temp/ds_alst           profile_hyclora.py:798   (alst — deepspeed >= 0.17)
+#       temp/arctic/...        profile_hyclora.py:815   (alst tiled_compute)
+#       temp/unsloth_pkgs      profile_unsloth.py:39    (PYTHONPATH, not sys.path)
+#       temp/liger_pkgs                                 (PYTHONPATH)
+#   `01c_stage_repos.sh` recreates it on fir from pinned upstream commits.
+#
+# ⚠ AND ds_alst MUST BE INSIDE IT. An earlier revision put the side-by-side
+#   DeepSpeed at $FIR_SCRATCH_ROOT/ds_alst while profile_hyclora.py:798 computes
+#   `<repo>/temp/ds_alst` from `__file__` and has no env override — so the setup
+#   script "verified sequence_parallel present: True" against a directory no ALST
+#   arm would ever look in. Route it through the temp symlink so both agree.
+FIR_DS_ALST="${FIR_DS_ALST:-$FIR_TEMP/ds_alst}"     # DeepSpeed>=0.17, ALST arms only
 
 # Create the scratch targets and the symlinks. Idempotent; refuses to clobber a
 # real directory that is not already a symlink.
 fir_link_scratch() {
-    mkdir -p "$FIR_VENV_REAL" "$FIR_DATA_REAL" "$FIR_DS_ALST"
+    mkdir -p "$FIR_VENV_REAL" "$FIR_DATA_REAL" "$FIR_TEMP_REAL"
     local pair
-    for pair in "./env:$FIR_VENV_REAL" "./data:$FIR_DATA_REAL"; do
+    for pair in "./env:$FIR_VENV_REAL" "./data:$FIR_DATA_REAL" "./temp:$FIR_TEMP_REAL"; do
         local link="${pair%%:*}" target="${pair#*:}"
         if [ -L "$link" ]; then
             [ "$(readlink -f "$link")" = "$(readlink -f "$target")" ] || {
@@ -195,11 +217,25 @@ fir_assert_env() {
     [ -d ./src ] || { echo "FAIL: not in repo root (no ./src)"; return 1; }
     [ -x "$FIR_VENV/bin/python" ] || { echo "FAIL: no venv at $FIR_VENV — run 01_setup_venv.sh"; return 1; }
 
+    # ⚠⚠ THIS LIST MUST COVER WHAT THE RUN ACTUALLY IMPORTS, NOT WHAT LOOKS CORE.
+    # fir preflight 54306984 (2026-08-12) printed `fir_assert_env PASSED` and then
+    # lost 4/4 arms to `ModuleNotFoundError` — triton, galore_torch, lomo_optim. The
+    # gate checked nine packages and none of the three that decided the job. A gate
+    # that passes a broken environment is worse than no gate: it moves the failure
+    # from a free login-node second to a GPU allocation.
+    # Rule: a package belongs here iff SOME arm imports it at MODULE scope. `triton`
+    # (flashffn.py:20) and `galore_torch` (train_glue.py:82, reached by every arm via
+    # run_production.write_row) are not optional at all.
     "$FIR_VENV/bin/python" - <<PY || rc=1
 import importlib, sys
 bad = []
 for m in ["numpy","torch","transformers","peft","datasets","accelerate",
-          "filelock","pandas","evaluate"]:
+          "filelock","pandas","evaluate",
+          "triton",          # flashffn.py:20 -- EVERY fb_* arm. NOT transitive on fir.
+          "galore_torch",    # train_glue.py:82 -- module scope, so EVERY arm's CSV write
+          "bitsandbytes",    # qlora arms
+          "deepspeed",       # zero3 arms
+          "tensorly"]:       # galore arms
     try: importlib.import_module(m)
     except Exception as e:
         # ⚠ PRINT THE MESSAGE, NOT JUST THE TYPE. "peft (RuntimeError)" is
@@ -230,6 +266,25 @@ if not torch.cuda.is_available():
 print(f"  torch {torch.__version__} cuda={torch.version.cuda} "
       f"dev={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)}")
 PY
+    fi
+
+    # --- the temp/ clones. Missing ones do not break the fused block, but they DO
+    # silently remove published-baseline arms from a §16 comparison, which is the
+    # worse failure: the sweep completes, the table is short, and nothing said so.
+    local miss=""
+    local probe
+    for probe in "lomo/lomo_optim" "galore/galore_torch" "minis" "streambp" \
+                 "arctic/arctic_training/model/tiled_compute.py" "ds_alst/deepspeed" \
+                 "liger_pkgs/liger_kernel" "unsloth_pkgs/unsloth" "HyC-LoRA-release"; do
+        [ -e "./temp/${probe}" ] || miss="$miss ${probe%%/*}"
+    done
+    if [ -n "$miss" ]; then
+        echo "  ⚠ temp/ clones MISSING ->$miss"
+        echo "    Those arms cannot run. temp/ is gitignored (.gitignore:8), so a repo"
+        echo "    sync does NOT carry it -> run: bash sbatch/fir/01c_stage_repos.sh"
+        rc=1
+    else
+        echo "  temp/ baseline clones: OK"
     fi
 
     ( fir_export_offline

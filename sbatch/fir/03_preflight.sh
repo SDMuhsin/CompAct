@@ -50,8 +50,17 @@ run_preflight() {
 
     echo; echo "--- CSV integrity ---"
     python - <<'PY' || rc=1
-import pandas as pd, sys
-d = pd.read_csv("results/production/fir_preflight.csv")
+import pandas as pd, os, sys
+# ⚠ REPORT THE REAL FAILURE, NOT A TRACEBACK ON TOP OF IT. When all four arms died
+# (job 54306984) the CSV was never created and this block ended the log with a
+# 16-line pandas FileNotFoundError — burying the three ModuleNotFoundErrors that
+# actually explained the job. The last thing in a log is what gets read first.
+p = "results/production/fir_preflight.csv"
+if not os.path.exists(p):
+    print(f"  NO CSV AT {p} — every arm failed before writing a row.")
+    print("  PREFLIGHT FAILED: read the per-arm tracebacks ABOVE, not this line.")
+    sys.exit(1)
+d = pd.read_csv(p)
 dups = d.duplicated(subset=["method","with_fb","task","seed","seq_len","batch_size","lr"]).sum()
 print(f"  rows={len(d)} cols={len(d.columns)} dup_comb_keys={dups} all_engaged={int(d.engagement_ok.all())}")
 print(d[["method","with_fb","engagement_ok","train_step_peak_alloc_mib","resident_floor_mib"]].to_string(index=False))

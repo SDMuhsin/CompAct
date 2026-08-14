@@ -188,6 +188,31 @@ stage "pinned HF stack" \
          "peft==${FIR_PIN_PEFT}" "accelerate==${FIR_PIN_ACCELERATE}" \
          evaluate sentencepiece filelock pandas scikit-learn
 
+# --- 4b. ⚠⚠ TRITON — MUST BE INSTALLED EXPLICITLY ON FIR, AND THAT IS THE WHOLE
+#         POINT OF THIS STAGE. It is NOT a per-method extra: `src/flashffn.py:20`
+#         does a bare `import triton` at module scope, so WITHOUT IT EVERY `fb_*`
+#         ARM — the entire artifact — fails at build_model.
+#
+# WHY IT WAS MISSED (fir preflight job 54306984, 2026-08-12, all four arms failed):
+#   On the dev box triton arrives as a TRANSITIVE DEPENDENCY of torch —
+#   `pip show torch` on `2.10.0+cu128` lists `triton` under Requires. Alliance's
+#   rebuild `torch-2.10.0+computecanada` DOES NOT declare it (they ship triton as a
+#   standalone wheelhouse package). So an installer that only names `torch` gets
+#   triton for free on the dev box and silently NOT on fir. The stack looked
+#   identical and one import was missing.
+#   The lesson generalises: NEVER rely on a transitive dependency across a rebuild.
+#
+# --- 4c. galore-torch is in requirements.txt but was absent from this script's
+#         hand-written list. It is NOT optional either, despite only the galore arms
+#         using it: `src/train_glue.py:82` imports it at MODULE scope, and
+#         `run_production.py:197` imports `train_glue.write_result_row` to write the
+#         result row for EVERY arm. On fir, baseline and qlora trained fine and then
+#         died writing their CSV row. A missing optimizer package destroyed the
+#         results of runs that had nothing to do with it.
+stage "triton + galore-torch (⚠ NOT transitive on fir — see comment above)" \
+      "import triton, galore_torch;print('  triton',triton.__version__,'/ galore_torch OK')" -- \
+      -q triton "galore-torch"
+
 # --- 5. per-method extras. Each is needed ONLY by its own arms, so a failure here
 #        costs those arms and nothing else.
 stage "bitsandbytes (qlora arms)" \
