@@ -17,8 +17,12 @@
 # ============================================================================
 set -uo pipefail
 
-cd "$(dirname "$0")/../.." || exit 1
+# FIR_SELF must be resolved BEFORE the cd: $0 is relative to the invocation
+# directory, and fir_log_to re-execs this script from the repo root.
+FIR_SELF="$(readlink -f "$0")"
+cd "$(dirname "$FIR_SELF")/../.." || exit 1
 source sbatch/fir/fir_env.sh
+fir_log_to fir_preflight_submit "$@"        # full transcript -> ./logs/fir_preflight_submit_<UTC>.log
 mkdir -p logs results/production
 
 LOCAL=false

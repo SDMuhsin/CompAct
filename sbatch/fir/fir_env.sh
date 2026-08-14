@@ -180,6 +180,37 @@ FIR_PIN_BNB="${FIR_PIN_BNB:-0.49.2}"
 fir_load_modules_cpu() { module load $FIR_MODULES_CPU; }
 fir_load_modules_gpu() { module load $FIR_MODULES_GPU; }
 
+# ---------------------------------------------------------------------------
+# LOGGING — every fir script writes a FULL transcript to ./logs/, automatically.
+#
+# Not a convenience. Diagnosing a fir failure from this repo means reading the
+# transcript, and asking for `2>&1 | tee ...` by convention has already produced
+# hand-pasted terminal scrollback that was TRUNCATED mid-line at the exact point
+# the outcome would have appeared (2026-08-14). A script that only prints is a
+# script whose failure cannot be handed to anyone.
+#
+# Usage — right after `cd` to the repo root, before any real work:
+#     FIR_SELF="$(readlink -f "$0")"      # BEFORE the cd; $0 is relative
+#     cd ...; source sbatch/fir/fir_env.sh
+#     fir_log_to fir_setup_venv "$@"
+# It re-execs the script once with stdout+stderr teed to the log, and the child
+# short-circuits on FIR_LOGGING. Exit status is preserved via PIPESTATUS.
+# ---------------------------------------------------------------------------
+fir_log_to() {   # fir_log_to <tag> "$@"
+    [ -n "${FIR_LOGGING:-}" ] && return 0
+    local tag="$1"; shift
+    [ -n "${FIR_SELF:-}" ] || { echo "fir_log_to: FIR_SELF unset — not logging"; return 0; }
+    mkdir -p ./logs
+    local f="./logs/${tag}_$(date -u +%Y%m%dT%H%M%SZ).log"
+    export FIR_LOGGING=1
+    echo "### transcript -> $f"
+    "$FIR_SELF" "$@" 2>&1 | tee "$f"
+    local rc=${PIPESTATUS[0]}
+    echo "### $tag exit=$rc" | tee -a "$f"
+    echo "### transcript: $f"
+    exit $rc
+}
+
 fir_export_online() {
     export HF_HOME="$FIR_DATA"
     export TORCH_HOME="$FIR_DATA"
@@ -271,20 +302,35 @@ PY
     # --- the temp/ clones. Missing ones do not break the fused block, but they DO
     # silently remove published-baseline arms from a §16 comparison, which is the
     # worse failure: the sweep completes, the table is short, and nothing said so.
-    local miss=""
-    local probe
-    for probe in "lomo/lomo_optim" "galore/galore_torch" "minis" "streambp" \
-                 "arctic/arctic_training/model/tiled_compute.py" "ds_alst/deepspeed" \
-                 "liger_pkgs/liger_kernel" "unsloth_pkgs/unsloth" "HyC-LoRA-release"; do
-        [ -e "./temp/${probe}" ] || miss="$miss ${probe%%/*}"
-    done
-    if [ -n "$miss" ]; then
-        echo "  ⚠ temp/ clones MISSING ->$miss"
-        echo "    Those arms cannot run. temp/ is gitignored (.gitignore:8), so a repo"
-        echo "    sync does NOT carry it -> run: bash sbatch/fir/01c_stage_repos.sh"
-        rc=1
+    #
+    # ⚠ ORDERING — `FIR_ASSERT_SKIP_TEMP=1` EXISTS FOR A REAL DEPENDENCY, NOT AS AN
+    #   ESCAPE HATCH. `01c_stage_repos.sh` needs the venv (it pip-installs into
+    #   --target prefixes), so it can only run AFTER `01_setup_venv.sh`. Without this
+    #   flag 01's own closing gate demands artifacts only 01c can create and a correct
+    #   fresh setup ALWAYS ends "SETUP INCOMPLETE" — observed on fir 2026-08-14.
+    #   01 sets it; 01c and 03_preflight do NOT, so nothing reaches a GPU unchecked.
+    #
+    # Each probe is the EXACT artifact the code loads, not the directory it sits in —
+    # a clone that fetched but left the pin unchecked-out would pass a bare -d test.
+    if [ -n "${FIR_ASSERT_SKIP_TEMP:-}" ]; then
+        echo "  temp/ baseline clones: SKIPPED (FIR_ASSERT_SKIP_TEMP -> run 01c_stage_repos.sh next)"
     else
-        echo "  temp/ baseline clones: OK"
+        local miss=""
+        local probe
+        for probe in "lomo/lomo_optim" "galore/galore_torch" "minis/minis/mini_sequence.py" \
+                     "streambp/src/streambp/stream_model.py" \
+                     "arctic/arctic_training/model/tiled_compute.py" "ds_alst/deepspeed" \
+                     "liger_pkgs/liger_kernel" "unsloth_pkgs/unsloth" "HyC-LoRA-release"; do
+            [ -e "./temp/${probe}" ] || miss="$miss ${probe%%/*}"
+        done
+        if [ -n "$miss" ]; then
+            echo "  ⚠ temp/ clones MISSING ->$miss"
+            echo "    Those arms cannot run. temp/ is gitignored (.gitignore:8), so a repo"
+            echo "    sync does NOT carry it -> run: bash sbatch/fir/01c_stage_repos.sh"
+            rc=1
+        else
+            echo "  temp/ baseline clones: OK"
+        fi
     fi
 
     ( fir_export_offline

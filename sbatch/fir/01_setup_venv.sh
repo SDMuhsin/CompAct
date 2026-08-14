@@ -24,8 +24,12 @@
 # ============================================================================
 set -uo pipefail
 
-cd "$(dirname "$0")/../.." || exit 1          # repo root
+# FIR_SELF must be resolved BEFORE the cd: $0 is relative to the invocation
+# directory, and fir_log_to re-execs this script from the repo root.
+FIR_SELF="$(readlink -f "$0")"
+cd "$(dirname "$FIR_SELF")/../.." || exit 1          # repo root
 source sbatch/fir/fir_env.sh
+fir_log_to fir_setup_venv "$@"        # full transcript -> ./logs/fir_setup_venv_<UTC>.log
 
 FRESH=false
 BUILD_FA=false
@@ -227,26 +231,21 @@ stage "tensorly (galore arms — their own requirements.txt)" \
       "import tensorly;print('  tensorly',tensorly.__version__)" -- \
       -q --no-deps tensorly
 
-# --- 6. DeepSpeed >= 0.17 SIDE-BY-SIDE for ALST only. Installed to a separate
-#        prefix and put on PYTHONPATH for ALST arms alone, because upgrading in
-#        place would silently change every zero3 number.
+# --- 6. DeepSpeed >= 0.17 SIDE-BY-SIDE for ALST — MOVED TO `01c_stage_repos.sh`.
 #
-# ⚠⚠ ALWAYS APPEND TO PYTHONPATH, NEVER ASSIGN IT. On fir, numpy is supplied by the
-#    `scipy-stack` MODULE, which puts it on PYTHONPATH — so `PYTHONPATH=/some/dir`
-#    silently removes numpy from the interpreter and deepspeed dies with
-#    `ModuleNotFoundError: No module named 'numpy'` from `deepspeed/utils/timer.py`.
-#    Observed on fir 2026-08-11. This applies to the ALST ARM AT RUN TIME too:
-#    use `PYTHONPATH=$FIR_DS_ALST:$PYTHONPATH`, not `PYTHONPATH=$FIR_DS_ALST`.
-echo; echo "--- deepspeed ${FIR_PIN_DEEPSPEED_ALST} side-by-side -> $FIR_DS_ALST ---"
-DS_BUILD_OPS=0 python -m pip install -q --no-deps --target "$FIR_DS_ALST" \
-    "deepspeed==${FIR_PIN_DEEPSPEED_ALST}" \
-  && PYTHONPATH="$FIR_DS_ALST:$PYTHONPATH" python -c "
-import importlib.util as u, sys
-sys.path.insert(0,'$FIR_DS_ALST')
-ok = u.find_spec('deepspeed.runtime.sequence_parallel') is not None
-print('  sequence_parallel present:', ok)
-sys.exit(0 if ok else 1)" \
-  || echo "  ⚠ ALST side-by-side deepspeed FAILED -> alst arms unavailable (nothing else affected)"
+# It installs into `temp/ds_alst`, which is a `temp/` artifact like every other
+# published-baseline dependency, and it now has exactly ONE installer. It was in
+# both scripts, and pip's `--target` silently SKIPS a package whose directory
+# already exists ("Target directory ... already exists. Specify --upgrade to force
+# replacement.") — so the second installer reported success while writing nothing.
+# Observed on fir 2026-08-14. Two installers into one prefix is how that hides.
+#
+# ⚠⚠ THE RUN-TIME RULE STAYS HERE BECAUSE IT IS A RUN-TIME RULE: ALWAYS APPEND TO
+#    PYTHONPATH, NEVER ASSIGN IT. On fir, numpy is supplied by the `scipy-stack`
+#    MODULE, which puts it on PYTHONPATH — so `PYTHONPATH=/some/dir` silently removes
+#    numpy from the interpreter and deepspeed dies with `ModuleNotFoundError: No
+#    module named 'numpy'` from `deepspeed/utils/timer.py`. Observed on fir
+#    2026-08-11. For the ALST arm use `PYTHONPATH=temp/ds_alst:$PYTHONPATH`.
 
 # --- 7. flash-attn LAST, and allowed to fail. This is the ONE genuinely risky
 #        dependency: on the dev box no wheel matched torch 2.10+cu128 and it had
@@ -327,10 +326,25 @@ fi
 assert_torch_pin "flash-attn stage"
 
 # --- 8. final gate
+#
+# ⚠ FIR_ASSERT_SKIP_TEMP IS LOAD-BEARING HERE, AND IT IS NOT A WORKAROUND.
+#   `01c_stage_repos.sh` pip-installs into --target prefixes, so it REQUIRES the venv
+#   this script builds and can only run after it. Without the flag, this gate demands
+#   artifacts only 01c can create, and a completely correct fresh setup ends with
+#   "SETUP INCOMPLETE — fix the above" and a list of missing clones that are not this
+#   script's job. That is what fir printed on 2026-08-14 after everything installed
+#   cleanly. The temp/ check is enforced, unskipped, by 01c's own closing gate and by
+#   03_preflight.sh — nothing reaches a GPU unchecked.
 echo; echo "############ verifying ############"
-fir_assert_env cpu || { echo "SETUP INCOMPLETE — fix the above before submitting anything"; exit 1; }
+FIR_ASSERT_SKIP_TEMP=1 fir_assert_env cpu \
+    || { echo "SETUP INCOMPLETE — fix the above before submitting anything"; exit 1; }
 echo
 echo "venv:  $(readlink -f "$FIR_VENV")"
 echo "data:  $(readlink -f "$FIR_DATA")  (empty until 02_download_cache.sh runs)"
+echo "temp:  $(readlink -f "$FIR_TEMP")  (empty until 01c_stage_repos.sh runs)"
+echo
+echo "NEXT:  bash sbatch/fir/01c_stage_repos.sh    # the published-baseline clones"
+echo "       bash sbatch/fir/02_download_cache.sh  # models/datasets/metrics"
+echo "       bash sbatch/fir/03_preflight.sh       # the GPU job that proves it"
 echo "flash-attn: $($FA_OK && echo available || echo 'UNAVAILABLE (streambp arms disabled)')"
 echo "NEXT: bash sbatch/fir/02_download_cache.sh"

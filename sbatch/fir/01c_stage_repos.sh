@@ -25,8 +25,12 @@
 # ============================================================================
 set -uo pipefail
 
-cd "$(dirname "$0")/../.." || exit 1          # repo root
+# FIR_SELF must be resolved BEFORE the cd: $0 is relative to the invocation
+# directory, and fir_log_to re-execs this script from the repo root.
+FIR_SELF="$(readlink -f "$0")"
+cd "$(dirname "$FIR_SELF")/../.." || exit 1          # repo root
 source sbatch/fir/fir_env.sh
+fir_log_to fir_stage_repos "$@"        # full transcript -> ./logs/fir_stage_repos_<UTC>.log
 
 FRESH=false
 [ "${1:-}" = "--fresh" ] && FRESH=true
@@ -78,32 +82,67 @@ done
 # a competitor's package can be put on PYTHONPATH for ITS arm alone and cannot
 # perturb any other arm's measurement. --no-deps for the same reason: unsloth pulls
 # a datasets/trl stack that would otherwise redefine the shared environment.
-target_stage() {   # target_stage <dir> <import-check> <pkg...>
-    local dir="$1" check="$2"; shift 2
+#
+# ⚠⚠ THE VERIFICATION MUST NOT EXECUTE THE PACKAGE. THIS SCRIPT RUNS ON A LOGIN
+#    NODE, WHICH HAS NO GPU. An earlier revision checked unsloth with a plain
+#    `import unsloth_zoo` and it raised, from a correctly installed package:
+#       unsloth_zoo/device_type.py:235
+#       NotImplementedError: Unsloth cannot find any torch accelerator? You need a GPU.
+#    unsloth_zoo evaluates `DEVICE_TYPE = get_device_type()` AT IMPORT TIME, so
+#    importing it anywhere without a GPU is fatal by design. pip had succeeded; the
+#    check condemned it. This is the same trap as flash-attn (§3.5 of hpc_fir.md) and
+#    it has now cost two round trips.
+#    `importlib.util.find_spec("<toplevel>")` resolves the package through the real
+#    PYTHONPATH — proving the --target prefix is importable — WITHOUT executing its
+#    module body. Whether the package actually runs is a GPU question, and
+#    03_preflight.sh is the GPU job that answers it.
+#    Two edge cases, both handled below rather than discovered on fir:
+#      - find_spec on a DOTTED name raises ModuleNotFoundError (it does not return
+#        None) when a parent is missing, so it must be wrapped;
+#      - a namespace package has `origin is None`, so the origin must be str()'d.
+find_spec_check() { printf '%s' "
+import importlib.util as u, sys
+n = '$1'
+try:
+    s = u.find_spec(n)
+except Exception as e:
+    print(f'  {n} NOT IMPORTABLE: {type(e).__name__}: {str(e)[:200]}'); sys.exit(1)
+print(f'  {n} -> {s.origin}' if s else f'  {n} NOT FOUND')
+sys.exit(0 if s else 1)
+"; }
+
+target_stage() {   # target_stage <dir> <toplevel-module> <pkg...>
+    local dir="$1" mod="$2"; shift 2
     echo; echo "--- $dir <- $* ---"
-    python -m pip install -q --no-deps --target "./temp/$dir" "$@" \
+    # ⚠ --upgrade IS REQUIRED. `pip install --target` with an existing directory
+    #   prints "Target directory ... already exists. Specify --upgrade to force
+    #   replacement." and SKIPS the package — so a re-run silently keeps whatever is
+    #   already there and reports success. Observed on fir 2026-08-14 (ds_alst).
+    python -m pip install -q --no-deps --upgrade --target "./temp/$dir" "$@" \
         || { echo "  FAIL: pip install --target ./temp/$dir"; rc=1; return 1; }
-    PYTHONPATH="$(pwd)/temp/$dir:${PYTHONPATH:-}" python -c "$check" \
+    PYTHONPATH="$(pwd)/temp/$dir:${PYTHONPATH:-}" python -c "$(find_spec_check "$mod")" \
         || { echo "  FAIL: post-install verification for ./temp/$dir"; rc=1; return 1; }
 }
 
-target_stage liger_pkgs \
-    "import liger_kernel;print('  liger_kernel OK')" "liger_kernel==0.5.10"
+target_stage liger_pkgs liger_kernel "liger_kernel==0.5.10"
 
-target_stage unsloth_pkgs \
-    "import unsloth_zoo;print('  unsloth OK')" \
+target_stage unsloth_pkgs unsloth_zoo \
     "unsloth==2026.8.1" "unsloth_zoo==2026.8.1" "trl==0.24.0" "datasets==4.3.0" \
     "hf_transfer" "structlog" "typer" "tyro" "nest_asyncio" "pillow"
 
 # ⚠ ds_alst GOES INSIDE temp/, NOT beside it. profile_hyclora.py:798 computes
 #   `<repo>/temp/ds_alst` from __file__ and offers no env override; an earlier
 #   revision installed it at $SCRATCH/CompAct/ds_alst and verified it there, so the
-#   check passed against a directory no ALST arm would ever consult. DS_BUILD_OPS=0
-#   keeps this a pure-python install (no nvcc on the login node).
-DS_BUILD_OPS=0 target_stage ds_alst \
-    "import importlib.util as u,sys;sys.exit(0 if u.find_spec('deepspeed.runtime.sequence_parallel') else 1)" \
-    "deepspeed==${FIR_PIN_DEEPSPEED_ALST}" \
-    && echo "  sequence_parallel present (ALST arms available)"
+#   check passed against a directory no ALST arm would ever consult. It is staged
+#   HERE and no longer in 01_setup_venv.sh — two installers into one prefix is how
+#   the "already exists, specify --upgrade" skip above went unnoticed.
+#   DS_BUILD_OPS=0 keeps this a pure-python install (no nvcc on the login node).
+DS_BUILD_OPS=0 target_stage ds_alst deepspeed "deepspeed==${FIR_PIN_DEEPSPEED_ALST}"
+# The ALST arms need one SUBmodule, not just the package. find_spec on a dotted name
+# imports the PARENT, and deepspeed's __init__ is safe on CPU (it prints "Setting
+# accelerator to CPU"), so this is login-node-safe — unlike unsloth_zoo above.
+PYTHONPATH="$(pwd)/temp/ds_alst:${PYTHONPATH:-}" python -c "$(find_spec_check deepspeed.runtime.sequence_parallel)" \
+    || { echo "  FAIL: deepspeed at temp/ds_alst lacks runtime.sequence_parallel -> ALST arms unavailable"; rc=1; }
 
 # --- 3. gate --------------------------------------------------------------------
 echo; echo "############ verifying ############"
