@@ -213,9 +213,43 @@ stage "pinned HF stack" \
 #         result row for EVERY arm. On fir, baseline and qlora trained fine and then
 #         died writing their CSV row. A missing optimizer package destroyed the
 #         results of runs that had nothing to do with it.
-stage "triton + galore-torch (⚠ NOT transitive on fir — see comment above)" \
-      "import triton, galore_torch;print('  triton',triton.__version__,'/ galore_torch OK')" -- \
-      -q triton "galore-torch"
+stage "triton (⚠ NOT transitive on fir — see comment above)" \
+      "import triton;print('  triton',triton.__version__)" -- \
+      -q triton
+
+# --- 4d. ⚠⚠ THE REPO'S OWN `requirements.txt`, UNDER A CONSTRAINTS FILE.
+#         THIS STAGE EXISTS TO END A CLASS OF FAILURE, NOT TO ADD A PACKAGE.
+#
+# Three fir preflight jobs died in a row on three DIFFERENT missing packages —
+# galore_torch (54306984), then lion_pytorch (54609748), with `adapters` queued up
+# behind it at train_glue.py:101. Every one of them is DECLARED IN requirements.txt
+# and was simply absent from this script's hand-written list. Fixing them one at a
+# time costs a GPU allocation per package and cannot converge, because the list is
+# long: train_glue.py has 48 unguarded module-scope imports and
+# `run_production.py:197` imports it, for EVERY arm, just to write a CSV row.
+#
+# So the installer stops curating and installs what the repo declares. The pinned
+# stages above still run FIRST and still decide the versions; `-c` then makes those
+# pins un-overridable, so requirements.txt's loose bounds (`torch>=2.0.0`,
+# `transformers>=4.30.0` — which alone would pull transformers 5.x and silently make
+# this a different experiment) cannot move anything that matters.
+#
+# ⚠ PEP 440: `torch==2.10.0` in the constraints file DOES match the installed
+#   `2.10.0+computecanada` — a local version label is ignored unless the specifier
+#   carries one. assert_torch_pin below is the receipt either way.
+CONSTRAINTS="$FIR_SCRATCH_ROOT/fir_constraints.txt"
+cat > "$CONSTRAINTS" <<EOF
+torch==${FIR_PIN_TORCH}
+transformers==${FIR_PIN_TRANSFORMERS}
+datasets==${FIR_PIN_DATASETS}
+peft==${FIR_PIN_PEFT}
+accelerate==${FIR_PIN_ACCELERATE}
+bitsandbytes==${FIR_PIN_BNB}
+EOF
+echo; echo "--- constraints ($CONSTRAINTS) ---"; sed 's/^/    /' "$CONSTRAINTS"
+stage "requirements.txt, constrained to the pins above" \
+      "import galore_torch, lion_pytorch, adapters, einops;print('  galore_torch / lion_pytorch / adapters / einops OK')" -- \
+      -q -r requirements.txt -c "$CONSTRAINTS"
 
 # --- 5. per-method extras. Each is needed ONLY by its own arms, so a failure here
 #        costs those arms and nothing else.

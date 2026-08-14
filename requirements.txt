@@ -11,7 +11,12 @@ pandas
 filelock
 bitsandbytes
 lion-pytorch
-adapter-transformers
+adapters==1.2.0          # ⚠ NOT `adapter-transformers` — that name now resolves to a
+                         # DEPRECATED 4.0.0 STUB whose only content is "use adapters
+                         # instead". It installs happily and provides NO `adapters`
+                         # module, so `train_glue.py:101 import adapters` still fails.
+                         # adapters 1.2.0 requires `transformers ~=4.51.3`, i.e. it
+                         # reinforces our pin rather than fighting it.
 peft
 galore-torch
 huggingface_hub[hf_xet]

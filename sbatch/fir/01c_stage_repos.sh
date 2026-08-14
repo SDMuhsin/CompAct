@@ -146,7 +146,12 @@ PYTHONPATH="$(pwd)/temp/ds_alst:${PYTHONPATH:-}" python -c "$(find_spec_check de
 
 # --- 3. gate --------------------------------------------------------------------
 echo; echo "############ verifying ############"
-echo "temp: $(readlink -f ./temp)   files=$(find ./temp -type f 2>/dev/null | wc -l)"
+# ⚠ `find -L`, NOT `find`. ./temp is a SYMLINK to /scratch, and find does not follow
+#   symlink arguments by default — so plain `find ./temp -type f` matches only the
+#   link itself (type l, not f) and reports `files=0` immediately after staging ~7,900
+#   of them. Printed exactly that on fir 2026-08-14, contradicting the clone check two
+#   lines below it. Cosmetic, but a status line that lies is worse than none.
+echo "temp: $(readlink -f ./temp)   files=$(find -L ./temp -type f 2>/dev/null | wc -l)"
 fir_assert_env cpu || rc=1
 [ $rc -eq 0 ] && echo "--- 01c_stage_repos OK ---" \
               || echo "--- 01c_stage_repos INCOMPLETE — arms above are unavailable ---"

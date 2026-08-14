@@ -211,10 +211,30 @@ fir_log_to() {   # fir_log_to <tag> "$@"
     exit $rc
 }
 
+# ⚠ TRITON'S CACHE MUST NOT LIVE ON /home, AND FIR PROVED IT.
+#   Both triton's JIT kernel cache and DeepSpeed's autotune cache default to
+#   `Path.home()/.triton` (`deepspeed/.../triton/matmul_ext.py:89` reads
+#   TRITON_CACHE_DIR first, then falls back to $HOME). On fir that produced, four
+#   times in one job (54609748):
+#       OSError: [Errno 5] Input/output error:
+#       '/home/sdmuhsin/.triton/autotune/Fp16Matmul_2d_kernel.pickle.tmp'
+#   Those arrived as "Exception ignored in atexit callback", so they were NOT the
+#   cause of that job's failure — but they are four unrelated tracebacks on top of
+#   the one that mattered, and DeepSpeed's own code warns that this directory on a
+#   network filesystem causes "slowdowns or hanging when DeepSpeed exits"
+#   (matmul_ext.py:49). The fused block JIT-compiles Triton kernels every job, so an
+#   unwritable cache is a latent hard failure and a per-job recompile, not just noise.
+#   /home is 48 GiB and quota-bound; /scratch is where every other cache already is.
+fir_export_triton_cache() {
+    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$FIR_SCRATCH_ROOT/.triton}"
+    mkdir -p "$TRITON_CACHE_DIR"
+}
+
 fir_export_online() {
     export HF_HOME="$FIR_DATA"
     export TORCH_HOME="$FIR_DATA"
     export HF_HUB_DISABLE_XET=1      # xet backend has produced stalled/partial pulls
+    fir_export_triton_cache
     mkdir -p "$HF_HOME"
 }
 
@@ -235,6 +255,7 @@ fir_export_offline() {
     # PYTORCH_ALLOC_CONF instead".)
     export PYTORCH_ALLOC_CONF=expandable_segments:True
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    fir_export_triton_cache
     export PYTHONPATH="$PYTHONPATH:$(pwd)/src"
     mkdir -p "$HF_HOME"
 }
@@ -248,22 +269,14 @@ fir_assert_env() {
     [ -d ./src ] || { echo "FAIL: not in repo root (no ./src)"; return 1; }
     [ -x "$FIR_VENV/bin/python" ] || { echo "FAIL: no venv at $FIR_VENV — run 01_setup_venv.sh"; return 1; }
 
-    # ⚠⚠ THIS LIST MUST COVER WHAT THE RUN ACTUALLY IMPORTS, NOT WHAT LOOKS CORE.
-    # fir preflight 54306984 (2026-08-12) printed `fir_assert_env PASSED` and then
-    # lost 4/4 arms to `ModuleNotFoundError` — triton, galore_torch, lomo_optim. The
-    # gate checked nine packages and none of the three that decided the job. A gate
-    # that passes a broken environment is worse than no gate: it moves the failure
-    # from a free login-node second to a GPU allocation.
-    # Rule: a package belongs here iff SOME arm imports it at MODULE scope. `triton`
-    # (flashffn.py:20) and `galore_torch` (train_glue.py:82, reached by every arm via
-    # run_production.write_row) are not optional at all.
+    # A floor check only. The REAL check is the entry-point import below — see the
+    # note there for why a curated package list is the wrong instrument.
     "$FIR_VENV/bin/python" - <<PY || rc=1
 import importlib, sys
 bad = []
 for m in ["numpy","torch","transformers","peft","datasets","accelerate",
           "filelock","pandas","evaluate",
           "triton",          # flashffn.py:20 -- EVERY fb_* arm. NOT transitive on fir.
-          "galore_torch",    # train_glue.py:82 -- module scope, so EVERY arm's CSV write
           "bitsandbytes",    # qlora arms
           "deepspeed",       # zero3 arms
           "tensorly"]:       # galore arms
@@ -288,6 +301,45 @@ for k, (want, got) in drift.items():
 if drift: sys.exit(1)
 print("  pinned stack: OK")
 PY
+
+    # ⚠⚠ THE ENTRY-POINT IMPORT. THIS IS THE CHECK THAT ENDS THE MISSING-MODULE
+    #    ROUND TRIPS, AND IT REPLACES CURATING A PACKAGE LIST.
+    #
+    # Three preflight jobs died on three different missing packages — galore_torch,
+    # then lion_pytorch, with `adapters` next in line — and each time the gate above
+    # had passed, because a hand-listed set of "core" packages cannot track 48
+    # unguarded module-scope imports in train_glue.py. Curating that list is the bug,
+    # not the omissions.
+    #
+    # So: import exactly what the job imports. `run_production.py` is the driver;
+    # `train_glue` is pulled in by `write_row` for EVERY arm; `flashffn` carries the
+    # triton dependency; `profile_hyclora` builds every method. If these five import,
+    # no arm can die of ModuleNotFoundError at module scope — and it costs ~6 seconds
+    # on a login node instead of a GPU allocation.
+    #
+    # Verified GPU-free on the dev box with CUDA_VISIBLE_DEVICES="" (all five import
+    # on CPU), so this is safe on a login node — unlike the unsloth_zoo trap.
+    # ⚠ PYTHONPATH, NOT `cd ./src`. $FIR_VENV is the RELATIVE `./env`, so a `cd` into
+    #   src makes `$FIR_VENV/bin/python` a path that does not exist and the check
+    #   fails for a reason that has nothing to do with the environment. And APPEND —
+    #   assigning PYTHONPATH deletes the scipy-stack numpy (§3 failure 6).
+    echo "  entry-point imports (what the job actually imports):"
+    ( PYTHONPATH="$(pwd)/src:${PYTHONPATH:-}" "$FIR_VENV/bin/python" - <<'PY' || exit 1
+import importlib, sys
+bad = []
+for m in ["experiment_registry", "flashffn", "profile_hyclora", "train_glue", "run_production"]:
+    try:
+        importlib.import_module(m)
+        print(f"    {m}: OK")
+    except Exception as e:
+        bad.append(m)
+        print(f"    {m}: FAILED -> {type(e).__name__}: {str(e)[:300]}")
+if bad:
+    print("    -> a module the run needs is missing or broken. Every arm importing it")
+    print("       will die on a compute node. Fix here, not in the sweep.")
+    sys.exit(1)
+PY
+    ) || rc=1
 
     if [ "$want" = "gpu" ]; then
         "$FIR_VENV/bin/python" - <<'PY' || rc=1

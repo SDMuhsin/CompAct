@@ -103,12 +103,37 @@ retry(lambda: load_dataset("cais/mmlu", "all"), "cais/mmlu all (14,042 test rows
 
 print("\n=== metrics ===")
 # `evaluate` ignores HF_HUB_OFFLINE at run time, so anything not cached here
-# costs ~44 min per seed on a compute node. SuperGLUE is out of scope.
-for m in ["glue", "accuracy", "f1", "matthews_correlation", "pearsonr", "spearmanr", "perplexity"]:
+# costs ~44 min per seed on a compute node.
+#
+# ⚠⚠ `evaluate.load("glue")` WITH NO CONFIG NAME CAN NEVER SUCCEED. It raises
+#    KeyError: 'You should supply a configuration name selected in ["sst2", ...]'.
+#    On fir 2026-08-14 it burned all three retries and logged
+#    "⚠ metric glue unavailable: KeyError" — which reads like a Hub outage and is
+#    actually a call that is wrong by construction. The metric was therefore NEVER
+#    CACHED, and `train_glue.py:2344` calls `evaluate.load("glue", args.task_name)`
+#    for every GLUE task. That is precisely the ~44-min-per-seed offline stall this
+#    whole script exists to prevent — it would have hit the camera-ready sweep, not
+#    the preflight. The config name is REQUIRED, one load per task.
+#
+# ⚠ AND SUPERGLUE IS NOT OUT OF SCOPE, WHATEVER THIS COMMENT USED TO SAY.
+#   `train_glue.py:2340` routes task_name in ("boolq","cb") to
+#   `evaluate.load("super_glue", args.task_name)`, and both tasks are in the
+#   production sweep (see the boolq/cb job names under logs/). Cache them.
+for t in ["cola", "mrpc", "sst2", "rte", "qnli", "stsb"]:
+    try:
+        retry(lambda t=t: evaluate.load("glue", t), f"metric:glue/{t}", n=3)
+    except Exception as e:
+        print(f"   ⚠ metric glue/{t} unavailable: {type(e).__name__}: {str(e)[:120]}")
+for t in ["boolq", "cb"]:
+    try:
+        retry(lambda t=t: evaluate.load("super_glue", t), f"metric:super_glue/{t}", n=3)
+    except Exception as e:
+        print(f"   ⚠ metric super_glue/{t} unavailable: {type(e).__name__}: {str(e)[:120]}")
+for m in ["accuracy", "f1", "matthews_correlation", "pearsonr", "spearmanr", "perplexity"]:
     try:
         retry(lambda m=m: evaluate.load(m), f"metric:{m}", n=3)
     except Exception as e:
-        print(f"   ⚠ metric {m} unavailable: {type(e).__name__}")
+        print(f"   ⚠ metric {m} unavailable: {type(e).__name__}: {str(e)[:120]}")
 PY
 
 echo
@@ -136,9 +161,17 @@ for args, label in [(("glue","rte"),"glue/rte"), (("cais/mmlu","all"),"mmlu"),
     try:
         load_dataset(*args); print(f"  {label} offline: OK")
     except Exception as e: fails.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
-try:
-    evaluate.load("accuracy"); print("  evaluate/accuracy offline: OK")
-except Exception as e: fails.append(f"evaluate: {type(e).__name__}: {str(e)[:120]}")
+# ⚠ VERIFY THE METRIC THE TASKS ACTUALLY LOAD, NOT THE ONE THAT IS EASY TO LOAD.
+#   This block used to check `evaluate.load("accuracy")` alone — which passed on fir
+#   2026-08-14 while the GLUE metric had never been cached at all, because the
+#   caching call above was malformed. A verifier that does not exercise the failing
+#   path certifies nothing. `glue/rte` is what train_glue.py:2344 calls;
+#   `super_glue/boolq` is what line 2340 calls.
+for args, label in [(("accuracy",),"accuracy"), (("glue","rte"),"glue/rte"),
+                    (("super_glue","boolq"),"super_glue/boolq")]:
+    try:
+        evaluate.load(*args); print(f"  evaluate/{label} offline: OK")
+    except Exception as e: fails.append(f"evaluate/{label}: {type(e).__name__}: {str(e)[:120]}")
 if fails:
     print("\n  OFFLINE VERIFICATION FAILED:"); [print("   -", f) for f in fails]
     sys.exit(1)
