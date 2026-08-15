@@ -27,16 +27,24 @@
 #   3. Re-running the script SKIPS cells already clean in the CSV, so a partial sweep
 #      resumes instead of restarting. Nothing is ever recomputed for free.
 #
-# ⚠ ONE CELL IS EXPECTED TO REFUSE, AND THAT IS THE CORRECT OUTCOME.
-#   ALST's own rule is `num_shards = ceil(seq / hidden)`. On a 2048-hidden model at
-#   any GLUE sequence length (128, or 384 for boolq) that is 1, i.e. NO TILING: their
-#   method configures itself to do nothing. `_eng_alst` reports `alst_tiling_active: 0`,
-#   the `_active` liveness rule fires, and `verify_engagement` refuses to write a row
-#   that would claim a method which did not run. The manifest marks these cells
-#   `expect=refusal` and the report counts them separately from breakage. **Do not
-#   "fix" this by passing --allow_inert** -- that writes a row claiming ALST ran.
-#   ALST is a long-sequence method and this task is not where it has anything to say;
-#   report it as inapplicable at this shape, with their rule as the reason.
+# SOME CELLS WILL NOT PRODUCE A ROW, AND THAT CAN BE THE CORRECT OUTCOME. The script
+# RECORDS which, from the run's own output -- it does NOT predict them:
+#
+#   REFUSED  illegal by construction. Confirmed for `streambp` on a classification
+#            head: StreamBP's mechanism IS the chunked LM head (it reads
+#            `model.lm_head.weight.grad`, stream_model.py:622-629), and
+#            LlamaForSequenceClassification has `score`, emitting one logit vector per
+#            sequence with nothing to chunk. run_production exits 0, writes no row.
+#   INERT    built, but proved no work, so `verify_engagement` refused the row.
+#            EXPECTED for `alst` here: their rule is num_shards = ceil(seq/hidden),
+#            which is 1 on a 2048-hidden model at any GLUE length -> no tiling.
+#            ⚠ NOT YET OBSERVED -- the first sweep's alst cells died earlier, on a
+#            missing PYTHONPATH, so this remains a prediction until a cell reaches it.
+#   ERROR    anything else. A broken cell. Fails the sweep, loudly.
+#
+# **Never "fix" a REFUSED or INERT cell with --allow_inert** -- that writes a row
+# claiming a method ran when it did not. Report it as inapplicable at this shape,
+# citing the method's own rule.
 #
 # ⚠ REGIME. GLUE runs on a sequence-classification head, so `--flce` is meaningless
 #   and refused (CONTEXT.md §8). Every row here is regime A by construction and the
@@ -82,6 +90,45 @@ P_TIME="${P_TIME:-3:00:00}"
 P_THROTTLE="${P_THROTTLE:-8}"
 
 MANIFEST="results/production/_sweep/${P_RUN_ID}_manifest.tsv"
+# Recorded (not predicted) outcomes for cells that produced no row. See run_cell's classifier.
+OUTCOMES="results/production/_sweep/${P_RUN_ID}_outcomes.tsv"
+
+# ---------------------------------------------------------------------------
+# PER-METHOD LEARNING RATE — the authors' own published value, cited.
+#
+# ⚠ ONE LR FOR EVERY ARM IS DETUNING, and the first sweep (54846646) did exactly that: it ran
+#   `--lr 2e-4` everywhere, which is a LoRA LR. What that did to the full-FT arms was NOT what I
+#   first assumed. LOMO is SGD-like -- its update is a fused `p.add_(grad, alpha=-self.lr)`
+#   (temp/lomo/lomo/src/lomo.py:101) -- so its published LR is 0.03, **150x LARGER** than what we
+#   gave it. Its collapse to the majority class was UNDER-training, not divergence.
+#
+# Citations, all verified in the vendored upstream repos under temp/:
+#   lomo     0.03    temp/lomo/lomo/config/args_lomo.yaml:20   (LLaMA-7B, SuperGLUE, full-param)
+#   adalomo  5e-4    temp/lomo/adalomo/instruction-tuning/train.py:145   (LLaMA-7B, Alpaca-GPT4)
+#   qlora    2e-4    temp/qlora/qlora.py:203 + scripts/finetune_guanaco_7b.sh:38  (<=13B default)
+#   galore   3e-5    temp/galore/README.md:146  (GaLore on GLUE MRPC, RoBERTa-base)
+#
+# ⚠ THREE CAVEATS THAT MUST TRAVEL WITH THIS TABLE.
+#   1. GaLore's repo contains NO full-fine-tuning LR at all. Its LLaMA-1B value (0.01,
+#      scripts/benchmark_c4/llama_1b.sh:4) is a PRETRAINING LR and must never be reused as a
+#      fine-tuning LR. 3e-5 is the closest fine-tuning number they publish and it is on a 125M
+#      RoBERTa, not a 1.1B decoder. Disclose this in any table that quotes GaLore's quality.
+#   2. NO repo publishes a ~1B-scale fine-tuning LR. Every value above is transplanted from 7B
+#      (or from 125M for GaLore). That is a disclosed limitation, not a hidden one.
+#   3. ⚠ THE LR IS NOT THE WHOLE SETTING. LOMO's config also carries `clip_grad_norm: 1.0`
+#      (args_lomo.yaml:25), `warmup: 0.1` (:24) and a linear scheduler (:23); QLoRA carries
+#      `max_grad_norm 0.3` and a constant scheduler. `run_production` implements NONE of these --
+#      it has no scheduler and no clipping. Running LOMO at 0.03 unclipped is NOT their recipe.
+#      See llmdocs/CONTEXT.md §16 for the state of that work.
+# ---------------------------------------------------------------------------
+cell_lr() {
+    case "$1" in
+        lomo)    echo "${P_LR_LOMO:-0.03}"    ;;
+        adalomo) echo "${P_LR_ADALOMO:-5e-4}" ;;
+        galore)  echo "${P_LR_GALORE:-3e-5}"  ;;
+        *)       echo "$P_LR"                 ;;   # peft arms + qlora: 2e-4, their own default
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # Build the manifest: one line per cell that still needs running.
@@ -120,11 +167,12 @@ if os.path.exists(csv_path):
         else:
             done_cells.add(key)
 
-# ALST's own rule: num_shards = ceil(seq/hidden). TinyLlama hidden = 2048. shards==1 -> no tiling
-# -> `alst_tiling_active: 0` -> verify_engagement refuses the row. Mark it, do not hide it.
-HIDDEN = 2048
-alst_inapplicable = math.ceil(seq / HIDDEN) <= 1
-
+# ⚠ NO REFUSAL PREDICTION HERE ANY MORE. An earlier revision marked alst `expect=refusal` from
+# ALST's `num_shards = ceil(seq/hidden)` rule, and `run_cell` then accepted ANY non-zero exit as
+# that refusal -- which silently absorbed a completely unrelated environment bug (missing
+# PYTHONPATH) and reported it as an expected methodological outcome. Refusals are now RECORDED by
+# `run_cell` from the run's own output, never predicted. Cells that refuse cost seconds, so there
+# is nothing to save by guessing in advance.
 lines, skipped = [], 0
 for method, fb in arms():
     for seed in seeds:
@@ -132,21 +180,18 @@ for method, fb in arms():
             skipped += 1
             continue
         regime = "full_ft" if method in FULL_FT_REGIME else "peft_lora"
-        expect = "refusal" if (method == "alst" and alst_inapplicable) else "ok"
         note   = "LOSSY" if method in LOSSY else "-"
-        lines.append(f"{method}\t{int(fb)}\t{seed}\t{regime}\t{expect}\t{note}")
+        lines.append(f"{method}\t{int(fb)}\t{seed}\t{regime}\t{note}")
 
 with open(manifest, "w") as f:
     f.write("\n".join(lines) + ("\n" if lines else ""))
 
-print(f"  task           glue:{task}   seq={seq} (hidden={HIDDEN})")
+print(f"  task           glue:{task}   seq={seq}")
 print(f"  seeds          {seeds}")
 print(f"  cells total    {len(arms()) * len(seeds)}")
 print(f"  already clean  {len(done_cells)} (skipped)")
 print(f"  dirty rows     {dirty} (will be re-run and upserted)" if dirty else "  dirty rows     0")
 print(f"  to run         {len(lines)}")
-if alst_inapplicable:
-    print(f"  ⚠ alst        ceil({seq}/{HIDDEN})=1 shards -> NO TILING; its cells are expect=refusal")
 print(f"  manifest       {manifest}")
 PY
 }
@@ -155,7 +200,7 @@ PY
 # Run ONE cell. Exported into the array job verbatim.
 # ---------------------------------------------------------------------------
 run_cell() {
-    local method="$1" fb="$2" seed="$3" expect="$4"
+    local method="$1" fb="$2" seed="$3"
     local fbflag=""; [ "$fb" = "1" ] && fbflag="--fb"
     local tag="${method}$([ "$fb" = "1" ] && echo "_fb")"
 
@@ -163,6 +208,24 @@ run_cell() {
     # shellcheck disable=SC1091
     source "$FIR_VENV/bin/activate" || return 1
     fir_export_offline
+
+    # ⚠ HONOUR `needs_pythonpath`. THIS WAS MISSING AND IT COST THE FIRST SWEEP ALL THREE alst
+    #   CELLS (array 54846646 tasks 6-8, 2026-08-15). ALST needs DeepSpeed >= 0.17 from the
+    #   side-by-side prefix `temp/ds_alst`; without it the venv's deliberately-pinned 0.16.5 loads
+    #   and `build_alst_model` raises. `validate_glue_runner.run_arm:113-115` already did this and
+    #   this function did not.
+    #   ⚠ APPEND, NEVER ASSIGN: on Alliance clusters numpy comes from the scipy-stack module via
+    #   PYTHONPATH, so `PYTHONPATH=temp/ds_alst` deletes numpy and deepspeed dies with
+    #   `ModuleNotFoundError: No module named 'numpy'` (hpc_fir.md §3 failure 6).
+    local need
+    need=$("$FIR_VENV/bin/python" -c "
+import sys; sys.path.insert(0, 'src')
+from experiment_registry import REGISTRY
+print(REGISTRY['$method'].needs_pythonpath or '')" 2>/dev/null)
+    if [ -n "$need" ]; then
+        export PYTHONPATH="$(pwd)/$need:${PYTHONPATH:-}"
+        echo "  needs_pythonpath: prepended $(pwd)/$need"
+    fi
 
     # ⚠ PER-CELL TORCH EXTENSION DIR. DeepSpeed JIT-builds `fused_adam` (62 s, seen in pilot
     #   54770596) into $TORCH_EXTENSIONS_DIR. Array tasks run CONCURRENTLY ON DIFFERENT NODES
@@ -190,25 +253,60 @@ PROBE
     local prc=$?
     [ $prc -eq 0 ] || echo "  ⚠ CONTEXT PROBE FAILED (exit $prc) on $(hostname) -- see CONTEXT.md §15.2"
 
-    echo "--- cell: $tag x glue:$P_TASK seed=$seed epochs=$P_EPOCHS expect=$expect ---"
-    local t0 rc=0
+    echo "--- cell: $tag x glue:$P_TASK seed=$seed lr=$(cell_lr "$method") epochs=$P_EPOCHS ---"
+    local t0 rc=0 out
     t0=$(date +%s)
     # ⚠ NO --allow_inert, EVER. It writes a row for a method that proved no work, which is the
     #   one failure this whole registry exists to prevent.
-    python src/run_production.py \
+    # Output is teed so the CLASSIFIER below can read it while the log still shows everything live.
+    out=$(python src/run_production.py \
         --method "$method" $fbflag --task "glue:$P_TASK" --seed "$seed" \
         --model "$P_MODEL" --epochs "$P_EPOCHS" ${P_SEQ:+--seq "$P_SEQ"} \
-        --batch "$P_BATCH" --lr "$P_LR" --device cuda:0 --warmup_steps 8 \
-        --run_id "$P_RUN_ID" --out_csv "$P_CSV" || rc=1
+        --batch "$P_BATCH" --lr "$(cell_lr "$method")" --device cuda:0 --warmup_steps 8 \
+        --run_id "$P_RUN_ID" --out_csv "$P_CSV" 2>&1 | tee /dev/stderr) || rc=1
     echo "--- $tag seed=$seed wall-clock: $(( $(date +%s) - t0 ))s  rc=$rc ---"
 
-    if [ "$expect" = "refusal" ]; then
-        # An engagement refusal is the CORRECT outcome here and must not look like a green cell.
-        [ $rc -ne 0 ] \
-            && { echo "EXPECTED REFUSAL -- $tag has nothing to do at this sequence length. OK."; return 0; } \
-            || { echo "⚠ $tag was expected to refuse and did NOT. Check its liveness counters."; return 1; }
+    # ------------------------------------------------------------------------
+    # CLASSIFY WHAT ACTUALLY HAPPENED. Do NOT predict it.
+    #
+    # ⚠ THIS REPLACES AN `expect=refusal` PREDICTION THAT PRODUCED A SILENT FAILURE. The first
+    #   sweep (54846646) marked the alst cells `expect=refusal` and then treated ANY non-zero exit
+    #   as that expected refusal -- so a missing PYTHONPATH, which is an ENVIRONMENT BUG, was
+    #   reported as "alst has nothing to do at this sequence length. OK." A prediction that
+    #   swallows its own falsification is worse than no check. Three outcomes, distinguished by
+    #   evidence from the run itself:
+    #
+    #     REFUSED  `CombinationRefused` -- the pair is illegal BY CONSTRUCTION (e.g. streambp on a
+    #              classification head: its mechanism IS the chunked LM head and there is none).
+    #              run_production exits 0 and writes no row. A correct outcome.
+    #     INERT    `EngagementFailure` -- the method built but proved no work, so the registry
+    #              refused to write a row claiming it ran. Also a correct outcome, and the one
+    #              alst is EXPECTED to reach once its PYTHONPATH is right.
+    #     ERROR    anything else. NOT correct. Must be loud.
+    # ------------------------------------------------------------------------
+    local status="ok"
+    if [ $rc -eq 0 ] && grep -q "^REFUSED " <<<"$out"; then
+        status="REFUSED"
+    elif grep -q "EngagementFailure" <<<"$out"; then
+        status="INERT"
+    elif [ $rc -ne 0 ]; then
+        status="ERROR"
     fi
-    return $rc
+
+    if [ "$status" != "ok" ]; then
+        # One line per non-ok cell, read back by run_report. Appended under flock because array
+        # tasks land here concurrently.
+        local reason
+        reason=$(grep -m1 -E "^REFUSED |EngagementFailure|^[A-Za-z_.]*Error" <<<"$out" | tr '\t\n' '  ' | cut -c1-300)
+        mkdir -p "$(dirname "$OUTCOMES")"
+        flock "$OUTCOMES.lock" -c \
+            "printf '%s\t%s\t%s\t%s\t%s\n' '$method' '$fb' '$seed' '$status' '${reason//\'/}' >> '$OUTCOMES'"
+        echo "  OUTCOME=$status  $reason"
+    fi
+
+    # REFUSED and INERT are correct outcomes and must not fail the cell. ERROR must.
+    [ "$status" = "ERROR" ] && return 1
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -217,9 +315,9 @@ PROBE
 # Named interpreter for the same reason as `build_manifest`: this is invoked both from the login
 # node (--report) and from a CPU-only report job, neither of which has an activated venv.
 run_report() {
-    P_TASK="$P_TASK" P_SEEDS="$P_SEEDS" P_CSV="$P_CSV" P_SEQ="$P_SEQ" \
+    P_TASK="$P_TASK" P_SEEDS="$P_SEEDS" P_CSV="$P_CSV" P_SEQ="$P_SEQ" OUTCOMES="$OUTCOMES" \
     "$FIR_VENV/bin/python" - <<'PY'
-import os, sys, math, json
+import os, sys, json
 sys.path.insert(0, "src")
 import pandas as pd
 from validate_glue_runner import arms, check_row
@@ -231,25 +329,40 @@ seeds = [int(s) for s in os.environ["P_SEEDS"].split()]
 csv_path = os.environ["P_CSV"]
 seq = int(os.environ["P_SEQ"]) if os.environ.get("P_SEQ") else \
       TASK_MAX_LENGTH.get(task, GLUE_DEFAULT_SEQ)
-alst_inapplicable = math.ceil(seq / 2048) <= 1
+
+# RECORDED outcomes, not predicted ones. `run_cell` appends a line for every cell that did not
+# produce a row, tagged REFUSED (illegal by construction) / INERT (built but proved no work) /
+# ERROR (anything else). A cell with no row and no recorded outcome is genuinely MISSING -- it
+# never ran, or it died before it could classify itself.
+outcomes = {}
+opath = os.environ.get("OUTCOMES", "")
+if opath and os.path.exists(opath):
+    for line in open(opath):
+        p = line.rstrip("\n").split("\t")
+        if len(p) >= 4:
+            outcomes[(p[0], int(p[1]), int(p[2]))] = (p[3], p[4] if len(p) > 4 else "")
 
 if not os.path.exists(csv_path):
     print(f"  no CSV at {csv_path}"); sys.exit(1)
 d = pd.read_csv(csv_path)
 d = d[d.task == f"glue:{task}"]
 
-rows, n_ok, n_bad, n_missing, n_refused = [], 0, 0, 0, 0
+rows, n_ok, n_bad, n_missing, n_refused, n_error = [], 0, 0, 0, 0, 0
 for method, fb in arms():
     tag = method + ("_fb" if fb else "")
     regime = "full_ft" if method in FULL_FT_REGIME else "peft_lora"
-    expect_refusal = (method == "alst" and alst_inapplicable)
     for seed in seeds:
         c = d[(d.method == method) & (d.with_fb == int(fb)) & (d.seed == seed)]
         if not len(c):
-            if expect_refusal:
-                status, n_refused = "REFUSED (by their own rule)", n_refused + 1
+            oc, reason = outcomes.get((method, int(fb), seed), (None, ""))
+            if oc in ("REFUSED", "INERT"):
+                status = f"{oc}: {reason[:60]}"
+                n_refused += 1
+            elif oc == "ERROR":
+                status = f"ERROR: {reason[:60]}"
+                n_error += 1
             else:
-                status, n_missing = "MISSING", n_missing + 1
+                status, n_missing = "MISSING (never ran)", n_missing + 1
             rows.append((regime, tag, seed, status, None, None, None))
             continue
         r = c.iloc[-1].to_dict()
@@ -272,12 +385,16 @@ for regime in ("peft_lora", "full_ft"):
         f = lambda v, w, d=4: (f"{float(v):{w}.{d}f}" if v is not None and v == v else " " * w)
         print(f"  {tag:14} {seed:>4}  {f(m,8)} {f(p,10,2)} {f(ms,9,2)}  {status}")
 
-print(f"\n  ok {n_ok} | anomalies {n_bad} | missing {n_missing} | refused-by-design {n_refused}")
-# Refusals are a correct outcome and do NOT fail the sweep. Anomalies and gaps do.
-if n_bad or n_missing:
+print(f"\n  ok {n_ok} | anomalies {n_bad} | missing {n_missing} | "
+      f"refused/inert {n_refused} | ERRORS {n_error}")
+# REFUSED and INERT are correct outcomes and do NOT fail the sweep -- they are findings about
+# where a method applies. Anomalies, gaps and ERRORS do fail it.
+if n_error:
+    print("  ⚠ ERRORS ABOVE ARE NOT METHODOLOGICAL REFUSALS -- they are broken cells. Fix them.")
+if n_bad or n_missing or n_error:
     print("  SWEEP INCOMPLETE -- re-run this script to fill gaps; investigate anomalies first.")
     sys.exit(1)
-print("  SWEEP CLEAN -- every permitted cell is present and passes the anomaly gate.")
+print("  SWEEP CLEAN -- every permitted cell either has a clean row or a recorded refusal.")
 PY
 }
 
@@ -300,7 +417,7 @@ if [ "$N" -eq 0 ]; then
 fi
 
 if [ "$MODE" = "dry" ]; then
-    echo "  --- manifest (method / fb / seed / regime / expect / note) ---"
+    echo "  --- manifest (method / fb / seed / regime / note) ---"
     nl -ba "$MANIFEST" | sed 's/^/    /'
     echo
     echo "  would submit: array 0-$((N-1))%$P_THROTTLE, ${P_TIME} per cell"
@@ -309,8 +426,8 @@ fi
 
 if [ "$MODE" = "local" ]; then
     rc=0
-    while IFS=$'\t' read -r method fb seed regime expect note; do
-        run_cell "$method" "$fb" "$seed" "$expect" || rc=1
+    while IFS=$'\t' read -r method fb seed regime note; do
+        run_cell "$method" "$fb" "$seed" || rc=1
     done < "$MANIFEST"
     echo; run_report || rc=1
     exit $rc
@@ -335,11 +452,13 @@ cd "\$SLURM_SUBMIT_DIR"
 source sbatch/fir/fir_env.sh
 export P_MODEL="$P_MODEL" P_TASK=$P_TASK P_EPOCHS=$P_EPOCHS P_SEQ="$P_SEQ"
 export P_BATCH=$P_BATCH P_LR=$P_LR P_RUN_ID=$P_RUN_ID P_CSV=$P_CSV
+export OUTCOMES="$OUTCOMES"
 line=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$MANIFEST")
-IFS=\$'\t' read -r method fb seed regime expect note <<< "\$line"
-echo "array task \$SLURM_ARRAY_TASK_ID -> \$method fb=\$fb seed=\$seed (\$regime, expect=\$expect)"
+IFS=\$'\t' read -r method fb seed regime note <<< "\$line"
+echo "array task \$SLURM_ARRAY_TASK_ID -> \$method fb=\$fb seed=\$seed (\$regime)"
+$(declare -f cell_lr)
 $(declare -f run_cell)
-run_cell "\$method" "\$fb" "\$seed" "\$expect"
+run_cell "\$method" "\$fb" "\$seed"
 EOF
 )
 echo "submitted sweep array $jid  ($N cells, throttle %$P_THROTTLE, $P_TIME each)"
@@ -359,7 +478,7 @@ rid=$(sbatch --parsable --dependency=afterany:$jid <<EOF
 cd "\$SLURM_SUBMIT_DIR"
 source sbatch/fir/fir_env.sh
 fir_load_modules_cpu
-export P_TASK=$P_TASK P_SEEDS="$P_SEEDS" P_CSV=$P_CSV P_SEQ="$P_SEQ"
+export P_TASK=$P_TASK P_SEEDS="$P_SEEDS" P_CSV=$P_CSV P_SEQ="$P_SEQ" OUTCOMES="$OUTCOMES"
 $(declare -f run_report)
 run_report
 EOF
