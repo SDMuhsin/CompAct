@@ -68,7 +68,27 @@ run_pilot() {
     fir_export_offline
     fir_assert_env gpu || return 1
 
+    # ⚠ IDENTIFY THE NODE. Job 54759272 failed at CUDA context creation on a card that reported
+    #   itself free, and the log could not say WHICH node it was -- so a rerun could not tell a bad
+    #   node from a systematic fault. Print it.
+    echo "node: $(hostname)   SLURM_JOB_ID=${SLURM_JOB_ID:-<none>}  NODELIST=${SLURM_JOB_NODELIST:-<none>}"
     echo; nvidia-smi; echo
+
+    # A CUDA-context probe in its OWN process, immediately before the run. `fir_assert_env gpu`
+    # already creates a context, but it did so 25 s before 54759272 failed; this narrows the window
+    # to ~1 s. If this PASSES and the run then fails the same way, something is taking the GPU
+    # between two processes on a card we were allocated exclusively -- which is the finding, not
+    # a detail.
+    echo "--- CUDA context probe (t-1s) ---"
+    python - <<'PROBE'
+import torch
+torch.cuda.set_device(0)
+free, total = torch.cuda.mem_get_info(0)
+print(f"  context OK on {torch.cuda.get_device_name(0)}: "
+      f"free={free/2**20:.0f} MiB / total={total/2**20:.0f} MiB", flush=True)
+PROBE
+    echo "  probe exit=$?"
+
     echo "--- pilot cell: $P_METHOD on glue:$P_TASK, seed $P_SEED, ${P_EPOCHS} epochs ---"
     local t0 rc=0
     t0=$(date +%s)
