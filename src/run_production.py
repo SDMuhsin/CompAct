@@ -316,7 +316,45 @@ def run_one(args) -> dict:
     # floor=0.00 in the first smoke test. Bind the process to the requested device so every
     # memory statistic below refers to the card the model is actually on.
     if str(device).startswith('cuda'):
-        torch.cuda.set_device(device)
+        # ⚠ REPORT THE STATE OF THE CARD IF THIS FAILS. `torch.cuda.set_device` only CREATES THE
+        #   CONTEXT -- it allocates nothing of ours -- so a `CUDA error: out of memory` here is not
+        #   this run exhausting the device. It is the context itself failing to be created, and the
+        #   causes are environmental: another tenant holding the GPU (processes outside our PID
+        #   namespace are invisible to `nvidia-smi`, §1), a cgroup/host-memory limit, an exclusive
+        #   compute mode, or a driver/runtime mismatch. It happened on fir job 54759272 at t+4s on a
+        #   card `nvidia-smi` had reported as 5 MiB used with no processes, 25 s after
+        #   `fir_assert_env gpu` had successfully created a context in another process on the same
+        #   node -- i.e. it was NOT reproducible from the log alone. A bare traceback there costs a
+        #   whole submit/queue round trip, so print what a diagnosis needs, then re-raise unchanged.
+        try:
+            torch.cuda.set_device(device)
+        except Exception as e:
+            import subprocess
+            print(f"\nCUDA INIT FAILED on {device}: {type(e).__name__}: {e}", flush=True)
+            print(f"  visible devices     : {os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}", flush=True)
+            try:
+                print(f"  torch.cuda.device_count: {torch.cuda.device_count()}", flush=True)
+            except Exception as e2:
+                print(f"  device_count unavailable: {type(e2).__name__}: {e2}", flush=True)
+            print(f"  PYTORCH_ALLOC_CONF  : {os.environ.get('PYTORCH_ALLOC_CONF', '<unset>')}", flush=True)
+            print(f"  PYTORCH_CUDA_ALLOC_CONF: {os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')}",
+                  flush=True)
+            print(f"  torch {torch.__version__} / cuda {torch.version.cuda}", flush=True)
+            try:
+                free, total = torch.cuda.mem_get_info(0)
+                print(f"  mem_get_info(0)     : free={free/2**20:.0f} MiB total={total/2**20:.0f} MiB",
+                      flush=True)
+            except Exception as e2:
+                print(f"  mem_get_info unavailable: {type(e2).__name__}: {e2}", flush=True)
+            for cmd in (["nvidia-smi", "--query-gpu=index,memory.used,memory.total,compute_mode",
+                         "--format=csv,noheader"],
+                        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"]):
+                try:
+                    out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+                    print(f"  {' '.join(cmd[1:2])}: {out or '<none>'}", flush=True)
+                except Exception:
+                    pass
+            raise
 
     # ---- task data FIRST: the head's shape is a property of the task ----
     tokenizer = train_dl = eval_dl = None
