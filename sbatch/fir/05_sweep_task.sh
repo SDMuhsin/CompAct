@@ -78,7 +78,15 @@ P_EPOCHS="${P_EPOCHS:-3}"
 P_SEQ="${P_SEQ:-}"
 P_BATCH="${P_BATCH:-16}"
 P_LR="${P_LR:-2e-4}"
-P_RUN_ID="${P_RUN_ID:-camera_ready_${P_TASK}}"
+# ⚠ RUN_ID SCOPES RESUME AND THE REPORT, AND THAT IS LOAD-BEARING -- BUMP IT WHEN THE
+#   CONFIGURATION CHANGES. `check_row` validates a row's NUMBERS, not the configuration that
+#   produced it, so a row can be perfectly clean and still scientifically invalid. Sweep 1's
+#   galore/qlora/adalomo rows all PASS `check_row` while having no gradient checkpointing and the
+#   wrong LR -- verified. Without run_id scoping, resume would mark those cells done and **skip
+#   exactly the arms that most need re-running**. Old rows are never deleted (§1); they stay under
+#   their own run_id and are ignored by both resume and the report.
+#   `_v2` = matched gc + published per-method LR + published clipping + the fb_variant axis.
+P_RUN_ID="${P_RUN_ID:-camera_ready_${P_TASK}_v2}"
 P_CSV="${P_CSV:-results/production/camera_ready_glue.csv}"
 
 # Per-cell wall time. The pilot's heaviest arm (zero3, the only DeepSpeed-engine arm) took
@@ -154,31 +162,36 @@ cell_clip() {
 #   venv is active and `python` may not exist at all -- the interpreter has to be named explicitly.
 #   It also needs pandas, which lives in the venv and not in the bare module stack.
 build_manifest() {
-    P_TASK="$P_TASK" P_SEEDS="$P_SEEDS" P_CSV="$P_CSV" P_SEQ="$P_SEQ" \
+    P_TASK="$P_TASK" P_SEEDS="$P_SEEDS" P_CSV="$P_CSV" P_SEQ="$P_SEQ" P_RUN_ID="$P_RUN_ID" \
     MANIFEST="$MANIFEST" "$FIR_VENV/bin/python" - <<'PY'
-import os, sys, math
+import os, sys
 sys.path.insert(0, "src")
 from validate_glue_runner import arms, check_row
-from experiment_registry import FULL_FT_REGIME, LOSSY
+from experiment_registry import FULL_FT_REGIME, LOSSY, resolve_fb_variant, CombinationRefused
 from run_production import TASK_MAX_LENGTH, GLUE_DEFAULT_SEQ
 
 task     = os.environ["P_TASK"]
 seeds    = [int(s) for s in os.environ["P_SEEDS"].split()]
 csv_path = os.environ["P_CSV"]
+run_id   = os.environ["P_RUN_ID"]
 manifest = os.environ["MANIFEST"]
 seq      = int(os.environ["P_SEQ"]) if os.environ.get("P_SEQ") else \
            TASK_MAX_LENGTH.get(task, GLUE_DEFAULT_SEQ)
 
-# Which cells are ALREADY clean? A row that exists but fails the anomaly gate is NOT clean --
-# it must be re-run, because a bad row in a camera-ready CSV is worse than a missing one.
+# ⚠ SCOPED TO run_id. `check_row` validates NUMBERS, not the configuration that produced them, so
+# a row can be clean and still invalid -- sweep 1's galore/qlora/adalomo rows all pass it while
+# having no gradient checkpointing and the wrong LR. Matching on (method, fb, variant, seed) alone
+# would mark those done and skip the very arms that need re-running. Bump P_RUN_ID on any
+# configuration change; the old rows stay in the CSV under their own run_id.
 done_cells, dirty = set(), 0
 if os.path.exists(csv_path):
     import pandas as pd
     d = pd.read_csv(csv_path)
-    d = d[d.task == f"glue:{task}"]
+    d = d[(d.task == f"glue:{task}") & (d.run_id == run_id)]
     for _, r in d.iterrows():
         r = r.to_dict()
-        key = (str(r.get("method")), int(r.get("with_fb") or 0), int(r.get("seed")))
+        key = (str(r.get("method")), int(r.get("with_fb") or 0),
+               str(r.get("fb_variant") or "none"), int(r.get("seed")))
         if check_row(r):
             dirty += 1                      # leave it in the CSV; the upsert will replace it
         else:
@@ -190,22 +203,41 @@ if os.path.exists(csv_path):
 # PYTHONPATH) and reported it as an expected methodological outcome. Refusals are now RECORDED by
 # `run_cell` from the run's own output, never predicted. Cells that refuse cost seconds, so there
 # is nothing to save by guessing in advance.
+# ⚠ `fb_variant` IS A THIRD AXIS AND `arms()` DOES NOT COVER IT. `arms()` enumerates
+# method x with_fb only, which is why sweep 1 silently contained NO `wstream` cell at all -- the
+# project's best peak-memory result (floor 2188.66 -> 88.66, a flat -1932.00 MiB) was missing from
+# a sweep whose whole point is peak memory. Derived from `resolve_fb_variant`, not hardcoded: it
+# declines wstream on every full-fine-tuning arm, because WP-E streams the FROZEN base weights and
+# a trainable base weight makes saving them as `None` unsound. Today that means exactly one arm --
+# `baseline_fb` -- carries both variants, so this adds 3 cells.
+def variants_for(method, fb):
+    if not fb:
+        return ["none"]                      # non-fb rows record fb_variant="none"
+    out = ["min"]
+    try:
+        resolve_fb_variant(method, fb, "wstream")
+        out.append("wstream")
+    except CombinationRefused:
+        pass                                 # structurally inapplicable; a correct exclusion
+    return out
+
 lines, skipped = [], 0
 for method, fb in arms():
-    for seed in seeds:
-        if (method, int(fb), seed) in done_cells:
-            skipped += 1
-            continue
-        regime = "full_ft" if method in FULL_FT_REGIME else "peft_lora"
-        note   = "LOSSY" if method in LOSSY else "-"
-        lines.append(f"{method}\t{int(fb)}\t{seed}\t{regime}\t{note}")
+    for variant in variants_for(method, fb):
+        for seed in seeds:
+            if (method, int(fb), variant, seed) in done_cells:
+                skipped += 1
+                continue
+            regime = "full_ft" if method in FULL_FT_REGIME else "peft_lora"
+            note   = "LOSSY" if method in LOSSY else "-"
+            lines.append(f"{method}\t{int(fb)}\t{seed}\t{variant}\t{regime}\t{note}")
 
 with open(manifest, "w") as f:
     f.write("\n".join(lines) + ("\n" if lines else ""))
 
 print(f"  task           glue:{task}   seq={seq}")
 print(f"  seeds          {seeds}")
-print(f"  cells total    {len(arms()) * len(seeds)}")
+print(f"  cells total    {sum(len(variants_for(m, f)) for m, f in arms()) * len(seeds)}")
 print(f"  already clean  {len(done_cells)} (skipped)")
 print(f"  dirty rows     {dirty} (will be re-run and upserted)" if dirty else "  dirty rows     0")
 print(f"  to run         {len(lines)}")
@@ -217,9 +249,9 @@ PY
 # Run ONE cell. Exported into the array job verbatim.
 # ---------------------------------------------------------------------------
 run_cell() {
-    local method="$1" fb="$2" seed="$3"
-    local fbflag=""; [ "$fb" = "1" ] && fbflag="--fb"
-    local tag="${method}$([ "$fb" = "1" ] && echo "_fb")"
+    local method="$1" fb="$2" seed="$3" variant="${4:-min}"
+    local fbflag=""; [ "$fb" = "1" ] && fbflag="--fb --fb_variant $variant"
+    local tag="${method}$([ "$fb" = "1" ] && echo "_fb")$([ "$variant" = "wstream" ] && echo "+ws")"
 
     fir_load_modules_gpu || return 1
     # shellcheck disable=SC1091
@@ -319,7 +351,7 @@ PROBE
         reason=$(grep -m1 -E "^REFUSED |EngagementFailure|^[A-Za-z_.]*Error" <<<"$out" | tr '\t\n' '  ' | cut -c1-300)
         mkdir -p "$(dirname "$OUTCOMES")"
         flock "$OUTCOMES.lock" -c \
-            "printf '%s\t%s\t%s\t%s\t%s\n' '$method' '$fb' '$seed' '$status' '${reason//\'/}' >> '$OUTCOMES'"
+            "printf '%s\t%s\t%s\t%s\t%s\t%s\n' '$method' '$fb' '$seed' '$variant' '$status' '${reason//\'/}' >> '$OUTCOMES'"
         echo "  OUTCOME=$status  $reason"
     fi
 
@@ -335,13 +367,23 @@ PROBE
 # node (--report) and from a CPU-only report job, neither of which has an activated venv.
 run_report() {
     P_TASK="$P_TASK" P_SEEDS="$P_SEEDS" P_CSV="$P_CSV" P_SEQ="$P_SEQ" OUTCOMES="$OUTCOMES" \
-    "$FIR_VENV/bin/python" - <<'PY'
+    P_RUN_ID="$P_RUN_ID" "$FIR_VENV/bin/python" - <<'PY'
 import os, sys, json
 sys.path.insert(0, "src")
 import pandas as pd
 from validate_glue_runner import arms, check_row
-from experiment_registry import FULL_FT_REGIME
+from experiment_registry import FULL_FT_REGIME, resolve_fb_variant, CombinationRefused
 from run_production import TASK_MAX_LENGTH, GLUE_DEFAULT_SEQ
+
+def variants_for(method, fb):
+    if not fb:
+        return ["none"]
+    out = ["min"]
+    try:
+        resolve_fb_variant(method, fb, "wstream"); out.append("wstream")
+    except CombinationRefused:
+        pass
+    return out
 
 task  = os.environ["P_TASK"]
 seeds = [int(s) for s in os.environ["P_SEEDS"].split()]
@@ -358,22 +400,26 @@ opath = os.environ.get("OUTCOMES", "")
 if opath and os.path.exists(opath):
     for line in open(opath):
         p = line.rstrip("\n").split("\t")
-        if len(p) >= 4:
-            outcomes[(p[0], int(p[1]), int(p[2]))] = (p[3], p[4] if len(p) > 4 else "")
+        if len(p) >= 5:
+            outcomes[(p[0], int(p[1]), int(p[2]), p[3])] = (p[4], p[5] if len(p) > 5 else "")
 
 if not os.path.exists(csv_path):
     print(f"  no CSV at {csv_path}"); sys.exit(1)
 d = pd.read_csv(csv_path)
-d = d[d.task == f"glue:{task}"]
+# Scoped to run_id for the same reason resume is -- a clean row from a superseded configuration
+# must not be reported as a result of THIS sweep.
+d = d[(d.task == f"glue:{task}") & (d.run_id == os.environ["P_RUN_ID"])]
 
 rows, n_ok, n_bad, n_missing, n_refused, n_error = [], 0, 0, 0, 0, 0
 for method, fb in arms():
-    tag = method + ("_fb" if fb else "")
+  for variant in variants_for(method, fb):
+    tag = method + ("_fb" if fb else "") + ("+ws" if variant == "wstream" else "")
     regime = "full_ft" if method in FULL_FT_REGIME else "peft_lora"
     for seed in seeds:
-        c = d[(d.method == method) & (d.with_fb == int(fb)) & (d.seed == seed)]
+        c = d[(d.method == method) & (d.with_fb == int(fb)) & (d.seed == seed)
+              & (d.fb_variant.astype(str) == variant)]
         if not len(c):
-            oc, reason = outcomes.get((method, int(fb), seed), (None, ""))
+            oc, reason = outcomes.get((method, int(fb), seed, variant), (None, ""))
             if oc in ("REFUSED", "INERT"):
                 status = f"{oc}: {reason[:60]}"
                 n_refused += 1
@@ -436,7 +482,7 @@ if [ "$N" -eq 0 ]; then
 fi
 
 if [ "$MODE" = "dry" ]; then
-    echo "  --- manifest (method / fb / seed / regime / note) ---"
+    echo "  --- manifest (method / fb / seed / variant / regime / note) ---"
     nl -ba "$MANIFEST" | sed 's/^/    /'
     echo
     echo "  would submit: array 0-$((N-1))%$P_THROTTLE, ${P_TIME} per cell"
@@ -445,8 +491,8 @@ fi
 
 if [ "$MODE" = "local" ]; then
     rc=0
-    while IFS=$'\t' read -r method fb seed regime note; do
-        run_cell "$method" "$fb" "$seed" || rc=1
+    while IFS=$'\t' read -r method fb seed variant regime note; do
+        run_cell "$method" "$fb" "$seed" "$variant" || rc=1
     done < "$MANIFEST"
     echo; run_report || rc=1
     exit $rc
@@ -473,12 +519,12 @@ export P_MODEL="$P_MODEL" P_TASK=$P_TASK P_EPOCHS=$P_EPOCHS P_SEQ="$P_SEQ"
 export P_BATCH=$P_BATCH P_LR=$P_LR P_RUN_ID=$P_RUN_ID P_CSV=$P_CSV
 export OUTCOMES="$OUTCOMES"
 line=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$MANIFEST")
-IFS=\$'\t' read -r method fb seed regime note <<< "\$line"
-echo "array task \$SLURM_ARRAY_TASK_ID -> \$method fb=\$fb seed=\$seed (\$regime)"
+IFS=\$'\t' read -r method fb seed variant regime note <<< "\$line"
+echo "array task \$SLURM_ARRAY_TASK_ID -> \$method fb=\$fb variant=\$variant seed=\$seed (\$regime)"
 $(declare -f cell_lr)
 $(declare -f cell_clip)
 $(declare -f run_cell)
-run_cell "\$method" "\$fb" "\$seed"
+run_cell "\$method" "\$fb" "\$seed" "\$variant"
 EOF
 )
 echo "submitted sweep array $jid  ($N cells, throttle %$P_THROTTLE, $P_TIME each)"

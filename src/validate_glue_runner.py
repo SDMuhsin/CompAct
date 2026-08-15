@@ -188,6 +188,20 @@ def check_row(r):
             bad.append(f"{tmn}={tm:.4f} <= majority baseline {base:.3f} for {task} "
                        f"-- indistinguishable from predicting one class")
 
+    # ⚠ A `wstream` ROW THAT DID NOT STREAM LOOKS EXACTLY LIKE A PERFECTLY GOOD `fb_min` ROW.
+    #   WP-E's entire effect is on the RESIDENT FLOOR -- it takes it from 2188.66 to 88.66 MiB, a
+    #   flat -1932.00 MiB at every sequence length (CONTEXT.md §13). If `install()` declines (it
+    #   refuses any model with trainable base weights) or the variant never reaches the builder,
+    #   the run still trains, still passes every other check here, and still records
+    #   `fb_variant=wstream` -- the "recorded but never reached the kernel" failure this project
+    #   has now hit five times. The floor is the receipt, so gate on the floor.
+    if str(r.get("fb_variant")) == "wstream":
+        fl = num("resident_floor_mib")
+        if fl is None or fl > 500:
+            bad.append(f"fb_variant=wstream but resident_floor_mib={r.get('resident_floor_mib')} "
+                       f"(>500: the streamer did not engage -- expected ~88 MiB, and `fb_wstream."
+                       f"_WS['last_declined']` records why install() declined)")
+
     pd_raw = r.get("pred_distribution")
     if pd_raw and str(pd_raw) != "nan":
         try:
