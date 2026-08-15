@@ -115,11 +115,11 @@ OUTCOMES="results/production/_sweep/${P_RUN_ID}_outcomes.tsv"
 #      RoBERTa, not a 1.1B decoder. Disclose this in any table that quotes GaLore's quality.
 #   2. NO repo publishes a ~1B-scale fine-tuning LR. Every value above is transplanted from 7B
 #      (or from 125M for GaLore). That is a disclosed limitation, not a hidden one.
-#   3. ⚠ THE LR IS NOT THE WHOLE SETTING. LOMO's config also carries `clip_grad_norm: 1.0`
-#      (args_lomo.yaml:25), `warmup: 0.1` (:24) and a linear scheduler (:23); QLoRA carries
-#      `max_grad_norm 0.3` and a constant scheduler. `run_production` implements NONE of these --
-#      it has no scheduler and no clipping. Running LOMO at 0.03 unclipped is NOT their recipe.
-#      See llmdocs/CONTEXT.md §16 for the state of that work.
+#   3. ⚠ THE LR IS NOT THE WHOLE SETTING. Clipping now travels with it (see `cell_clip`), but the
+#      SCHEDULERS still do not: LOMO ships `warmup: 0.1` + linear (args_lomo.yaml:23-24) and QLoRA
+#      ships constant + `warmup_ratio 0.03`. `run_production --lr_scheduler/--warmup_ratio` exist
+#      and RAISE on the DeepSpeed and LOMO arms, which own their own update path -- so those two
+#      recipes are reproduced on LR and clipping but not on schedule. State that in the table.
 # ---------------------------------------------------------------------------
 cell_lr() {
     case "$1" in
@@ -127,6 +127,23 @@ cell_lr() {
         adalomo) echo "${P_LR_ADALOMO:-5e-4}" ;;
         galore)  echo "${P_LR_GALORE:-3e-5}"  ;;
         *)       echo "$P_LR"                 ;;   # peft arms + qlora: 2e-4, their own default
+    esac
+}
+
+# Gradient-norm clipping, same sourcing rule as the LR. Empty = off, which is how every row
+# before 2026-08-15 was measured.
+#
+# ⚠ LOMO's 1.0 IS EXPENSIVE AND THAT IS THEIRS, NOT OURS. Their clipping is a two-pass protocol
+#   (`grad_norm(loss)` + a second forward before `fused_backward`, lomo_trainer.py:105-172), which
+#   MEASURED +74% peak on this artifact (8305 -> 14469 MiB). It is in their published config
+#   (args_lomo.yaml:25), so running without it is also a deviation -- just a cheaper one. Whichever
+#   way this is set, the lomo row must say which, because it moves the memory column a lot.
+#   Default here is ON, i.e. faithful to their config; set P_CLIP_LOMO= to turn it off.
+cell_clip() {
+    case "$1" in
+        lomo|adalomo) echo "${P_CLIP_LOMO-1.0}" ;;   # args_lomo.yaml:25
+        qlora)        echo "${P_CLIP_QLORA-0.3}" ;;  # temp/qlora/qlora.py:205
+        *)            echo "${P_CLIP-}"          ;;
     esac
 }
 
@@ -253,16 +270,18 @@ PROBE
     local prc=$?
     [ $prc -eq 0 ] || echo "  ⚠ CONTEXT PROBE FAILED (exit $prc) on $(hostname) -- see CONTEXT.md §15.2"
 
-    echo "--- cell: $tag x glue:$P_TASK seed=$seed lr=$(cell_lr "$method") epochs=$P_EPOCHS ---"
+    echo "--- cell: $tag x glue:$P_TASK seed=$seed lr=$(cell_lr "$method") clip=$(cell_clip "$method") epochs=$P_EPOCHS ---"
     local t0 rc=0 out
     t0=$(date +%s)
     # ⚠ NO --allow_inert, EVER. It writes a row for a method that proved no work, which is the
     #   one failure this whole registry exists to prevent.
     # Output is teed so the CLASSIFIER below can read it while the log still shows everything live.
+    local _clip; _clip=$(cell_clip "$method")
     out=$(python src/run_production.py \
         --method "$method" $fbflag --task "glue:$P_TASK" --seed "$seed" \
         --model "$P_MODEL" --epochs "$P_EPOCHS" ${P_SEQ:+--seq "$P_SEQ"} \
-        --batch "$P_BATCH" --lr "$(cell_lr "$method")" --device cuda:0 --warmup_steps 8 \
+        --batch "$P_BATCH" --lr "$(cell_lr "$method")" ${_clip:+--max_grad_norm "$_clip"} \
+        --device cuda:0 --warmup_steps 8 \
         --run_id "$P_RUN_ID" --out_csv "$P_CSV" 2>&1 | tee /dev/stderr) || rc=1
     echo "--- $tag seed=$seed wall-clock: $(( $(date +%s) - t0 ))s  rc=$rc ---"
 
@@ -457,6 +476,7 @@ line=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$MANIFEST")
 IFS=\$'\t' read -r method fb seed regime note <<< "\$line"
 echo "array task \$SLURM_ARRAY_TASK_ID -> \$method fb=\$fb seed=\$seed (\$regime)"
 $(declare -f cell_lr)
+$(declare -f cell_clip)
 $(declare -f run_cell)
 run_cell "\$method" "\$fb" "\$seed"
 EOF
