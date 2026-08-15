@@ -18,11 +18,22 @@ WHAT THIS GUARANTEES, AND WHY EACH GUARANTEE EXISTS
 6. **Task AND computational metrics in the same row**, so a quality/memory trade is readable without
    joining two files.
 
-⚠ SCOPE OF THE TASK LAYER TODAY. `--task lm:<hf_dataset>` (causal-LM perplexity) is wired, because
-every registry builder constructs an `AutoModelForCausalLM` and that is the head they all share.
-**GLUE and the multiple-choice suites need the builders parameterised by model class**
-(`AutoModelForSequenceClassification` / the registered `AutoModelForMultipleChoice`); until that
-lands, `--task glue:*` / `--task mc:*` raise rather than silently measuring the wrong head.
+SCOPE OF THE TASK LAYER
+-----------------------
+* `--task lm:synthetic` -- causal-LM perplexity on a fixed random batch. Computational metrics only;
+  the "perplexity" of random tokens is a receipt that the step ran, NOT a quality number.
+* `--task glue:<config>` -- **real GLUE/SuperGLUE training and evaluation** on a
+  sequence-classification head, with the task's own official metric. This is the quality half of
+  the §16 mandate. Enabled by `profile_hyclora.load_base_model`, which parameterises all eight
+  builders by head; before that every builder hardcoded `AutoModelForCausalLM` and this runner
+  refused `glue:*` rather than measure the wrong head.
+* `--task mc:*` -- still refused. The commonsense/MMLU suites need the registered
+  `AutoModelForMultipleChoice`, which `load_base_model` does not yet construct.
+
+⚠ REGIME. `--flce` applies Liger `FusedLinearCrossEntropy` (regime B, CONTEXT.md §8) via
+`profile_unsloth._apply_flce`, and it must be passed BEFORE the model is built because it is a
+class-level monkey-patch. **It is meaningless on a GLUE head** -- there is no LM head and no
+vocab-sized logits to fuse -- so `--flce` with `--task glue:*` is refused rather than recorded.
 """
 
 from __future__ import annotations
@@ -42,7 +53,8 @@ import torch  # noqa: E402
 import profile_hyclora as ph  # noqa: E402
 from experiment_registry import (  # noqa: E402
     REGISTRY, FB_COMPAT, FLCE_FORBIDDEN, FULL_FT_REGIME, LOSSY,
-    resolve_arm, verify_engagement, CombinationRefused,
+    resolve_arm, resolve_head, resolve_fb_variant, verify_engagement,
+    CombinationRefused, EngagementFailure,
 )
 
 CSV_COLUMNS = [
@@ -50,10 +62,20 @@ CSV_COLUMNS = [
     "timestamp", "run_id", "method", "with_fb", "arm", "task", "seed", "model_name_or_path",
     # --- protocol / hyperparameters ---
     "regime", "exact", "seq_len", "batch_size", "grad_accum", "train_steps", "lr",
+    "epochs", "steps_per_epoch", "best_epoch", "seq_source",
     "lora_r", "lora_alpha", "lora_dropout", "target_modules", "adapter_dtype",
-    "gc_variant", "flce", "attn_implementation", "n_trainable_params",
+    "gc_variant", "fb_variant", "wstream_json", "flce", "attn_implementation",
+    "n_trainable_params",
     # --- task metrics ---
-    "eval_loss", "perplexity", "accuracy", "f1", "matthews_correlation",
+    # `task_metric_name`/`task_metric` carry the task's OWN headline metric (MCC for cola, F1 for
+    # mrpc/qqp, Pearson for stsb, accuracy elsewhere), so a sweep is readable without knowing which
+    # task filled which column. The named columns stay populated too, for joins with mo53_glue.csv.
+    "eval_loss", "perplexity", "accuracy", "f1", "matthews_correlation", "pearson", "spearmanr",
+    "task_metric_name", "task_metric", "task_metric_json",
+    # `pred_distribution` is the degeneracy receipt -- see evaluate_glue(). `n_train_examples` and
+    # `n_eval_examples` make "trained on how much?" answerable from the row alone.
+    "pred_distribution", "n_train_examples", "n_eval_examples", "eval_split", "dataset_source",
+    "train_steps_total",
     # --- computational metrics ---
     "train_step_peak_alloc_mib", "train_step_peak_reserved_mib", "resident_floor_mib",
     "peak_minus_floor_mib", "ms_per_step_median", "ms_per_step_iqr", "total_train_time_sec",
@@ -62,14 +84,205 @@ CSV_COLUMNS = [
     "engagement_ok", "engagement_json", "method_config_json", "config_hash",
     "torch_version", "harness", "notes",
 ]
-# One row per (method, fb, task, seed, seq, batch, lr). Re-running a cell UPDATES it in place.
-COMB_COLS = ["method", "with_fb", "task", "seed", "seq_len", "batch_size", "lr"]
+# One row per (method, fb, fb_variant, task, seed, seq, batch, lr). Re-running a cell UPDATES it
+# in place. ⚠ `fb_variant` is in the key deliberately: `fb_min` and `fb_min_wstream` are different
+# arms sharing every other coordinate, so without it the second run silently overwrites the first.
+COMB_COLS = ["method", "with_fb", "fb_variant", "task", "seed", "seq_len", "batch_size", "lr"]
+
+
+def _model_dtype(model):
+    """The dtype the model actually computes in, read off a live parameter rather than a flag --
+    the same discipline the protocol demands for adapter dtype (CONTEXT.md 8)."""
+    for p in model.parameters():
+        if p.is_floating_point():
+            return p.dtype
+    return torch.float32
+
+
+def _wstream_stats(with_fb, fb_variant):
+    """The streamer's own receipt -- host bytes pinned, H2D per step, blocked acquires. A saving
+    with an unchanged floor is a bug, so the row must carry the evidence, not just the arm name."""
+    if not (with_fb and fb_variant == "wstream"):
+        return None
+    import fb_wstream as _fbw
+    return _fbw.fb_wstream_stats()
 
 
 def _cfg(args):
     return {"model": args.model, "lora_r": args.lora_r, "seq": args.seq, "batch": args.batch,
             "iteration_threshold": 5, "softmax_outlier_ratio": 0.05,
             "layernorm_outlier_ratio": 0.005, "q_bit": 4}
+
+
+# ==============================================================================================
+# GLUE / SuperGLUE task layer
+# ==============================================================================================
+# ⚠ ROUTING IS COPIED FROM `train_glue.py`, NOT INVENTED, so a row here and a row there describe
+#   the same task. `boolq`/`cb` live in SuperGLUE and take the `super_glue` dataset AND metric
+#   (train_glue.py:2340); everything else is GLUE (train_glue.py:2344). Getting this wrong does not
+#   crash -- it silently scores against the wrong metric.
+SUPER_GLUE_TASKS = ("boolq", "cb")
+
+# ---------------------------------------------------------------------------------------------
+# PER-TASK SEQUENCE LENGTH. ⚠ MEASURED with the model's OWN tokenizer (TinyLlama), 4,000 train
+# examples per task, on 2026-08-14 -- not chosen by eye:
+#
+#   task    mean   p50   p90   p95   p99   max   | complete at 128 | at 384 | at 512
+#   boolq  161.7   149   261   311   422  1041   |     38.6%       | 98.3%  | 99.6%
+#   qnli    56.9    53    84    96   121   663   |     99.2%       |  100%  |  100%
+#   sst2    14.9    11    30    37    51    68   |      100%       |  100%  |  100%
+#
+# **At 128, boolq loses 61.4% of its examples to truncation** -- it is question+passage, and the
+# passage is where the answer is. That is not a small effect: the dev-box pilot scored 0.6664
+# against a 0.6217 majority baseline with 92% of predictions on one class, which is what a model
+# reading truncated passages should look like. 384 keeps 98.3% intact for 3x the tokens; 512 would
+# buy the last 1.3%. Every other task is complete at 128, so raising them would cost memory and
+# time for literally nothing.
+#
+# ⚠ THE PRICE, AND IT MUST BE STATED WHEREVER THIS TABLE IS: boolq's memory and step-time columns
+#   are NO LONGER COMPARABLE with the other tasks' -- both scale with sequence length. `seq_len` is
+#   in COMB_COLS so the row is keyed by it, and `seq_source` records whether the value came from
+#   this policy or an explicit flag. Compare boolq across ARMS, never across TASKS.
+GLUE_DEFAULT_SEQ = 128                      # train_glue.py's own --max_length default
+TASK_MAX_LENGTH = {"boolq": 384}            # everything else takes GLUE_DEFAULT_SEQ
+
+
+def resolve_seq(explicit, is_glue, glue_name):
+    """(seq, source). `--seq` still wins when given; the policy fills in when it is not."""
+    if explicit is not None:
+        return explicit, "explicit"
+    if is_glue:
+        return TASK_MAX_LENGTH.get(glue_name, GLUE_DEFAULT_SEQ), "task_policy"
+    return 1024, "default"
+
+# `stsb` is a REGRESSION task: one output, Pearson/Spearman, not accuracy. num_labels=1 is what
+# switches LlamaForSequenceClassification's loss to MSE (train_glue.py:1614).
+REGRESSION_TASKS = ("stsb",)
+
+
+def _glue_metric_key(name):
+    """The metric a task is scored by. Used to fill the single `task_metric_*` pair so a sweep can
+    be read without knowing which task produced which column."""
+    return {"cola": "matthews_correlation", "stsb": "pearson",
+            "mrpc": "f1", "qqp": "f1"}.get(name, "accuracy")
+
+
+def build_glue_data(name, tokenizer, args):
+    """Load + tokenize one GLUE/SuperGLUE config. Returns (train_dl, eval_dl, num_labels, sizes)."""
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader
+    from transformers import default_data_collator
+    from train_glue import task_to_keys                      # ONE definition of the key mapping
+
+    if name not in task_to_keys:
+        raise KeyError(f"unknown task {name!r}; known: {sorted(task_to_keys)}")
+    s1, s2 = task_to_keys[name]
+    if s1 is None:
+        raise ValueError(f"glue:{name} is not a sentence-classification task "
+                         f"(task_to_keys says {s1, s2}) -- use --task lm:* for the causal-LM sets")
+
+    if name in SUPER_GLUE_TASKS:
+        # ⚠ SuperGLUE's cache is SPLIT ACROSS TWO REPO NAMES on this project's disk, and neither
+        #   resolves both configs: `boolq` is under `aps/super_glue`, `cb` under `super_glue`.
+        #   datasets>=4 dropped script-based loading, so the bare name fails with
+        #   "Couldn't find a module script" wherever only the script repo was cached. Try the
+        #   candidates in order and RECORD which one answered, so the row says where its data
+        #   came from instead of leaving it to be re-derived.
+        raw = last = None
+        for cand in ("aps/super_glue", "super_glue", "super_glue_mirror"):
+            try:
+                raw = load_dataset(cand, name)
+                sg_source = cand
+                break
+            except Exception as e:                                  # noqa: BLE001
+                last = f"{cand}: {type(e).__name__}: {str(e)[:120]}"
+        if raw is None:
+            raise RuntimeError(f"glue:{name} is SuperGLUE and no cached mirror resolved it. "
+                               f"Last error -- {last}. Cache it with 02_download_cache.sh.")
+    else:
+        raw = load_dataset("glue", name)
+        sg_source = "glue"
+    is_regression = name in REGRESSION_TASKS
+    num_labels = 1 if is_regression else len(raw["train"].features["label"].names)
+
+    def _tok(batch):
+        args_ = (batch[s1],) if s2 is None else (batch[s1], batch[s2])
+        # ⚠ padding="max_length", NOT dynamic padding. Two reasons, both load-bearing here:
+        #   (1) a memory/throughput number is only comparable across arms at a FIXED shape, and this
+        #       runner reports peak memory in the same row as the metric;
+        #   (2) several arms fix their shape at build time -- StreamBP's chunk is seq//3 and ALST's
+        #       num_shards is ceil(seq/hidden) -- so a ragged batch would change the method's own
+        #       configuration from step to step.
+        out = tokenizer(*args_, padding="max_length", max_length=args.seq, truncation=True)
+        out["labels"] = batch["label"]
+        return out
+
+    keep = ["input_ids", "attention_mask", "labels"]
+    enc = raw.map(_tok, batched=True, remove_columns=raw["train"].column_names,
+                  desc=f"tokenizing {name}")
+    enc = enc.remove_columns([c for c in enc["train"].column_names if c not in keep])
+    enc.set_format("torch")
+
+    eval_split = "validation_matched" if name == "mnli" else "validation"
+    train_ds, eval_ds = enc["train"], enc[eval_split]
+    if args.max_train_samples:
+        train_ds = train_ds.select(range(min(args.max_train_samples, len(train_ds))))
+    if args.max_eval_samples:
+        eval_ds = eval_ds.select(range(min(args.max_eval_samples, len(eval_ds))))
+
+    g = torch.Generator().manual_seed(args.seed)
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True, generator=g,
+                          collate_fn=default_data_collator, drop_last=True)
+    eval_dl = DataLoader(eval_ds, batch_size=args.batch, shuffle=False,
+                         collate_fn=default_data_collator)
+    return train_dl, eval_dl, num_labels, {"n_train": len(train_ds), "n_eval": len(eval_ds),
+                                           "eval_split": eval_split, "is_regression": is_regression,
+                                           "dataset_source": sg_source}
+
+
+def _to_device(batch, device, is_regression, dtype):
+    """Move a batch to the device, casting REGRESSION labels to the model's dtype.
+
+    ⚠ stsb's labels are `Value('float32')` while the model runs in bf16, and
+    `LlamaForSequenceClassification` with num_labels==1 takes the MSELoss branch, which compares
+    them directly: `RuntimeError: Found dtype Float but expected BFloat16`. Classification labels
+    are int64 and must NOT be touched -- cross-entropy wants integer targets.
+    """
+    out = {k: v.to(device) for k, v in batch.items()}
+    if is_regression and "labels" in out:
+        out["labels"] = out["labels"].to(dtype)
+    return out
+
+
+def evaluate_glue(model, eval_dl, name, is_regression, device):
+    """Run the eval split and score it with the task's OWN official metric.
+
+    Also returns the PREDICTION DISTRIBUTION. That is not decoration: the classic silent failure of
+    a decoder classifier on a small GLUE task is a model that collapses to one class and scores the
+    majority baseline (0.527 on RTE, 0.684 on MRPC) -- a number that looks like learning. A
+    degenerate predictor is only visible in the label histogram, so it travels in the row.
+    """
+    import evaluate as hf_evaluate
+    from collections import Counter
+
+    metric = hf_evaluate.load("super_glue" if name in SUPER_GLUE_TASKS else "glue", name)
+    model.eval()
+    preds_hist, n, loss_sum = Counter(), 0, 0.0
+    with torch.no_grad():
+        for batch in eval_dl:
+            batch = _to_device(batch, device, is_regression, _model_dtype(model))
+            out = model(**batch)
+            logits = out.logits
+            preds = logits.squeeze(-1).float() if is_regression else logits.argmax(dim=-1)
+            metric.add_batch(predictions=preds, references=batch["labels"])
+            if not is_regression:
+                preds_hist.update(preds.tolist())
+            if getattr(out, "loss", None) is not None:
+                loss_sum += float(out.loss) * batch["labels"].shape[0]
+            n += batch["labels"].shape[0]
+    model.train()
+    scores = metric.compute()
+    return scores, (loss_sum / max(n, 1)), dict(sorted(preds_hist.items())), n
 
 
 def run_one(args) -> dict:
@@ -81,6 +294,20 @@ def run_one(args) -> dict:
     if method in FLCE_FORBIDDEN and args.flce:
         raise ValueError(f"{method}: --flce forbidden (its own chunked LM head IS the fused CE)")
 
+    is_glue = args.task.startswith("glue:")
+    glue_name = args.task.split(":", 1)[1] if is_glue else None
+    # Refuse an impossible head BEFORE tokenising a dataset or loading a model (registry
+    # SEQ_CLS_REFUSES). A refusal is a correct, cheap outcome; an AttributeError 40 frames into
+    # StreamBP's backward is not.
+    resolve_head(method, "seq_cls" if is_glue else "causal_lm")
+    resolve_fb_variant(method, with_fb, args.fb_variant)
+    if is_glue and args.flce:
+        raise ValueError(
+            "--flce is meaningless on a GLUE head: Liger FusedLinearCrossEntropy fuses the LM head "
+            "with a vocab-sized cross-entropy, and a sequence-classification head has neither. "
+            "Refusing rather than recording flce=1 on a run that cannot use it.")
+
+    args.seq, seq_source = resolve_seq(args.seq, is_glue, glue_name)
     torch.manual_seed(args.seed)
     cfg = _cfg(args)
     device = args.device
@@ -91,20 +318,85 @@ def run_one(args) -> dict:
     if str(device).startswith('cuda'):
         torch.cuda.set_device(device)
 
+    # ---- task data FIRST: the head's shape is a property of the task ----
+    tokenizer = train_dl = eval_dl = None
+    task_info = {}
+    if is_glue:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        train_dl, eval_dl, num_labels, task_info = build_glue_data(glue_name, tokenizer, args)
+        cfg.update({"head": "seq_cls", "num_labels": num_labels, "task_name": glue_name,
+                    "pad_token_id": tokenizer.pad_token_id})
+
+    # ---- regime B, if asked for. ⚠ MUST PRECEDE build_model: `_apply_flce` monkey-patches the
+    #      model CLASS, so a model already constructed keeps the stock fp32-logits CE.
+    #      ⚠⚠ THIS CALL WAS MISSING UNTIL 2026-08-14. `--flce` was parsed, checked against
+    #      FLCE_FORBIDDEN and written into the row as `flce=1`, but never applied -- so every row
+    #      this runner had produced, including the fir preflight's four, was regime A wearing a
+    #      regime B label. CONTEXT.md §8: regime B is where competitor claims are adjudicated, and
+    #      the CE stack is 875 MiB at seq 1024/batch 2, larger than everything the block saves.
+    flce_receipt = None
+    if args.flce:
+        # ⚠ `liger_kernel` is installed into the `temp/liger_pkgs` --target prefix, NOT the venv,
+        #   so that a competitor's package cannot perturb any other arm's measurement. Put it on
+        #   the path here rather than let `_apply_flce` die on ModuleNotFoundError.
+        _lp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "temp", "liger_pkgs")
+        if os.path.isdir(_lp) and _lp not in sys.path:
+            sys.path.insert(0, _lp)
+        try:
+            from profile_unsloth import _apply_flce
+            flce_receipt = _apply_flce(args.model)
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                f"--flce needs liger_kernel, which lives in {_lp} (a pip --target prefix, not the "
+                f"venv). Missing: {e}. Run sbatch/fir/01c_stage_repos.sh, or drop --flce and say "
+                f"regime A in the writeup -- do NOT record flce=1 on a run that did not use it.")
+
+    # The fused-block variant. `fb_min` is the shipped artifact; `wstream` (WP-E) additionally
+    # streams the FROZEN base weights from pinned host memory, which removes a flat ~1932 MiB from
+    # the resident floor at every sequence length. On GLUE shapes the floor IS the peak (87.6% of
+    # it at seq 128), so this is the variant a peak-memory comparison wants. Costs ~2 GiB of pinned
+    # HOST memory and single-digit % step time. Authority: memory_compression.md WP-E.
+    fb_variant = args.fb_variant
+
     if arm == "" or arm == "_fb":                          # the `baseline` family
-        base = "fb_min_fnorm_sdpa" if with_fb else "gc_manual_sdpa"
+        if with_fb:
+            base = ("fb_min_wstream_fnorm_sdpa" if fb_variant == "wstream"
+                    else "fb_min_fnorm_sdpa")
+        else:
+            base = "gc_manual_sdpa"
         model = ph.build_model(base, cfg, device, adapter_dtype="bf16")
         arm_str = base
     else:
+        # A composed arm carries the variant in its own name; `build_model` parses `wstream` at the
+        # top of the dispatcher, so `lomo_fb_wstream` reaches `apply_flash_block` with it enabled.
+        if with_fb and fb_variant == "wstream":
+            arm = arm + "_wstream"
         model = ph.build_model(arm, cfg, device, adapter_dtype="bf16")
         arm_str = arm
+    if with_fb and fb_variant == "wstream":
+        import fb_wstream as _fbw
+        _st = _fbw.fb_wstream_stats()
+        # ⚠ VERIFY FROM THE STREAMER, NEVER FROM THE ARM NAME (memory_compression.md). An arm
+        #   called `_wstream` whose streamer never installed is a full-residency run wearing a
+        #   streaming label, and its floor would silently be 2 GiB too high.
+        if not (_st.get("installed") and _st.get("on")):
+            raise EngagementFailure(
+                f"fb_variant=wstream requested but the streamer did not install: {_st}. "
+                f"This row would claim a memory mechanism that never ran.")
 
     constituents = [method] + (["fb"] if with_fb else [])
     engagement = verify_engagement(model, constituents, strict=not args.allow_inert)
 
     # ---- train: the harness's own step(), so the recipe matches every measured row ----
-    vocab = ph.hf_config(model).vocab_size
-    batch = ph.make_batch(cfg, device, vocab)
+    if is_glue:
+        batch = None                                       # real batches come from the dataloader
+    else:
+        vocab = ph.hf_config(model).vocab_size
+        batch = ph.make_batch(cfg, device, vocab)
     trainable = [p for p in model.parameters() if p.requires_grad]
     if getattr(model, "_galore_groups", None) is not None:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
@@ -114,32 +406,91 @@ def run_one(args) -> dict:
     else:
         opt = torch.optim.AdamW(trainable, lr=args.lr)
 
-    for _ in range(args.warmup_steps):                     # protocol §A.2 warm-up
-        ph.step(model, batch, opt)
+    def _batches():
+        """The step source. `lm:synthetic` re-uses ONE fixed batch (that is deliberate -- it makes
+        the computational measurement shape-exact and method-independent). GLUE streams real
+        examples and re-opens the loader when the epoch ends."""
+        if not is_glue:
+            while True:
+                yield batch
+        while True:
+            for b in train_dl:
+                yield _to_device(b, device, task_info.get("is_regression", False), _mdtype)
+
+    _mdtype = _model_dtype(model)
+    src = _batches()
+
+    # ---- the step budget -------------------------------------------------------------------
+    # `--epochs` is the camera-ready control: a task is trained for E passes over its OWN train
+    # split, so a small task (cb, 250 rows) and a large one (qnli, 105k) each get a comparable
+    # amount of learning instead of an arbitrary shared step cap. `--train_steps` remains the
+    # explicit override for smoke tests and for `lm:synthetic`, where there is no epoch.
+    steps_per_epoch = len(train_dl) if is_glue else 0
+    if is_glue and args.epochs:
+        total_steps = max(1, steps_per_epoch * args.epochs)
+    else:
+        total_steps = args.train_steps
+    eval_every = steps_per_epoch if (is_glue and args.epochs) else 0
+
+    # ⚠ WHAT `warmup_steps` MEANS DIFFERS BY TASK, AND THE DIFFERENCE IS DELIBERATE.
+    #   On `lm:synthetic` these are throwaway steps on a fixed batch, purely to reach steady state
+    #   before timing (protocol §A.2). On GLUE they are REAL OPTIMIZATION STEPS on real examples --
+    #   discarding them would discard training. They are excluded from the timing/memory statistics
+    #   and counted in `train_steps_total`, so the quality number reflects every step taken.
+    for _ in range(args.warmup_steps):
+        ph.step(model, next(src), opt)
     torch.cuda.synchronize()
     import gc as _gc
     _gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
     resident_before = torch.cuda.memory_allocated()
 
     times, peaks_a, peaks_r, losses = [], [], [], []
-    for _ in range(args.train_steps):
+    best = None
+    _metric_key = _glue_metric_key(glue_name) if is_glue else None
+    for _i in range(total_steps):
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
-        loss = ph.step(model, batch, opt)
+        loss = ph.step(model, next(src), opt)
         torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
         peaks_a.append(torch.cuda.max_memory_allocated())
         peaks_r.append(torch.cuda.max_memory_reserved())
         if loss is not None:
             losses.append(float(loss))
+        # ⚠ EVALUATE AT EACH EPOCH BOUNDARY AND KEEP THE BEST. End-of-training is the wrong
+        #   estimator on the small GLUE tasks -- rte (2.5k) and cb (250) overfit within a couple of
+        #   epochs, so the last epoch is routinely worse than the third. `train_glue.py` reports a
+        #   best-over-epochs metric, and a row here that reported the final epoch would not be
+        #   comparable with it. The eval runs under no_grad and is excluded from `times`.
+        if eval_every and (_i + 1) % eval_every == 0 and (_i + 1) < total_steps:
+            _sc, _el, _ph_, _n = evaluate_glue(model, eval_dl, glue_name,
+                                               task_info["is_regression"], device)
+            _v = _sc.get(_metric_key)
+            if _v is not None and (best is None or _v > best[0]):
+                best = (_v, _sc, _el, _ph_, _n, (_i + 1) // eval_every)
 
     # ---- evaluate ----
-    model.eval()
-    with torch.no_grad():
-        out = model(**batch)
-        eval_loss = float(out.loss)
-    model.train()
-    ppl = float(torch.exp(torch.tensor(min(eval_loss, 20.0))))
+    task_scores, pred_hist, ppl = {}, None, None
+    if is_glue:
+        task_scores, eval_loss, pred_hist, n_scored = evaluate_glue(
+            model, eval_dl, glue_name, task_info["is_regression"], device)
+        final_v = task_scores.get(_metric_key)
+        if best is not None and final_v is not None and best[0] > final_v:
+            # An earlier epoch was better: report it, and record WHICH, so the row says whether the
+            # number came from the end of training or from a peak the run then walked away from.
+            task_scores, eval_loss, pred_hist, n_scored = best[1], best[2], best[3], best[4]
+            task_info["best_epoch"] = best[5]
+        else:
+            task_info["best_epoch"] = (total_steps // eval_every) if eval_every else None
+        task_info["n_scored"] = n_scored
+        task_info["steps_per_epoch"] = steps_per_epoch
+    else:
+        model.eval()
+        with torch.no_grad():
+            out = model(**batch)
+            eval_loss = float(out.loss)
+        model.train()
+        ppl = float(torch.exp(torch.tensor(min(eval_loss, 20.0))))
 
     times_s = sorted(times)
     receipt = {}
@@ -157,10 +508,16 @@ def run_one(args) -> dict:
         "regime": "full_ft" if method in FULL_FT_REGIME else "peft_lora",
         "exact": int(method not in LOSSY),
         "seq_len": args.seq, "batch_size": args.batch, "grad_accum": 1,
-        "train_steps": args.train_steps, "lr": args.lr,
+        "train_steps": total_steps, "lr": args.lr,
+        "epochs": args.epochs if is_glue else None,
+        "seq_source": seq_source,
+        "steps_per_epoch": task_info.get("steps_per_epoch"),
+        "best_epoch": task_info.get("best_epoch"),
         "lora_r": args.lora_r, "lora_alpha": args.lora_r, "lora_dropout": 0.0,
         "target_modules": ",".join(ph.FB_TARGETS), "adapter_dtype": "bf16",
         "gc_variant": (receipt.get("ckpt_receipt") or {}).get("variant", "none"),
+        "fb_variant": fb_variant if with_fb else "none",
+        "wstream_json": json.dumps(_wstream_stats(with_fb, fb_variant), sort_keys=True, default=str),
         "flce": int(bool(args.flce)),
         "attn_implementation": "sdpa",
         # ⚠ Under ZeRO-3 a parameter is PARTITIONED, so `p.numel()` returns the local shard (and 0
@@ -169,7 +526,20 @@ def run_one(args) -> dict:
         "n_trainable_params": sum(getattr(p, "ds_numel", None) or p.numel()
                                   for p in model.parameters() if p.requires_grad),
         "eval_loss": eval_loss, "perplexity": ppl,
-        "accuracy": None, "f1": None, "matthews_correlation": None,
+        "accuracy": task_scores.get("accuracy"),
+        "f1": task_scores.get("f1"),
+        "matthews_correlation": task_scores.get("matthews_correlation"),
+        "pearson": task_scores.get("pearson"),
+        "spearmanr": task_scores.get("spearmanr"),
+        "task_metric_name": _glue_metric_key(glue_name) if is_glue else None,
+        "task_metric": task_scores.get(_glue_metric_key(glue_name)) if is_glue else None,
+        "task_metric_json": json.dumps(task_scores, sort_keys=True, default=str) if is_glue else None,
+        "pred_distribution": json.dumps(pred_hist) if pred_hist is not None else None,
+        "n_train_examples": task_info.get("n_train"),
+        "n_eval_examples": task_info.get("n_scored", task_info.get("n_eval")),
+        "eval_split": task_info.get("eval_split"),
+        "dataset_source": task_info.get("dataset_source"),
+        "train_steps_total": args.warmup_steps + total_steps,
         "train_step_peak_alloc_mib": max(peaks_a) / 2 ** 20,
         "train_step_peak_reserved_mib": max(peaks_r) / 2 ** 20,
         "resident_floor_mib": resident_before / 2 ** 20,
@@ -192,9 +562,13 @@ def run_one(args) -> dict:
 
 
 def write_row(csv_path: str, row: dict) -> bool:
-    """Lock-protected atomic upsert. Reuses `train_glue.write_result_row`, which is the path already
-    proven against concurrent HPC array jobs (FileLock 300s, 5 retries, temp-file + os.replace)."""
-    from train_glue import write_result_row
+    """Lock-protected atomic upsert (FileLock 300s, 5 retries, temp-file + os.replace).
+
+    ⚠ Imported from `results_csv`, NOT from `train_glue`. Importing `train_glue` here pulled
+    galore_torch / lion_pytorch / adapters into the write path and destroyed three fir preflight
+    jobs whose training had already succeeded. Read `results_csv`'s docstring before fanning
+    hundreds of writers at one CSV -- the lock is `fcntl.flock` and Lustre can make it node-local."""
+    from results_csv import write_result_row
     return write_result_row(csv_path, CSV_COLUMNS, COMB_COLS, row)
 
 
@@ -205,26 +579,39 @@ def main():
     ap.add_argument("--task", default="lm:synthetic")
     ap.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--seq", type=int, default=1024)
+    # ⚠ default None, resolved by `resolve_seq`: 1024 for lm:*, and the per-task GLUE policy
+    #   above otherwise (128, or 384 for boolq). Passing --seq explicitly still wins.
+    ap.add_argument("--seq", type=int, default=None)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--seed", type=int, default=41)
     ap.add_argument("--warmup_steps", type=int, default=8)
     ap.add_argument("--train_steps", type=int, default=6)
-    ap.add_argument("--flce", action="store_true")
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="GLUE: train for E passes over the task's own train split (camera-ready "
+                         "control). Overrides --train_steps. Evaluates each epoch, keeps the best.")
+    ap.add_argument("--fb_variant", default="min", choices=["min", "wstream"],
+                    help="which fused-block variant --fb selects: `min` (shipped artifact) or "
+                         "`wstream` (WP-E, streams the frozen base weights; best peak memory)")
+    ap.add_argument("--flce", action="store_true",
+                    help="regime B: Liger FusedLinearCrossEntropy. Causal-LM tasks only.")
+    ap.add_argument("--max_train_samples", type=int, default=None,
+                    help="truncate the GLUE train split (smoke tests)")
+    ap.add_argument("--max_eval_samples", type=int, default=None,
+                    help="truncate the GLUE eval split (smoke tests)")
     ap.add_argument("--allow_inert", action="store_true",
                     help="DEBUG ONLY: write the row even if a method proved no work")
     ap.add_argument("--run_id", default="adhoc")
     ap.add_argument("--out_csv", required=True)
     args = ap.parse_args()
 
-    if args.task.startswith(("glue:", "mc:")):
+    if args.task.startswith("mc:"):
         raise NotImplementedError(
-            f"{args.task}: the registry's builders construct AutoModelForCausalLM. GLUE needs a "
-            f"sequence-classification head and the commonsense/MMLU suites need the registered "
-            f"AutoModelForMultipleChoice; parameterising the builders by model class is the next "
-            f"step. Refusing rather than measuring the wrong head.")
+            f"{args.task}: the commonsense/MMLU suites need the registered "
+            f"AutoModelForMultipleChoice, which `profile_hyclora.load_base_model` does not yet "
+            f"construct. GLUE is wired (`--task glue:<config>`); this is the same change one head "
+            f"further. Refusing rather than measuring the wrong head.")
 
     try:
         row = run_one(args)
@@ -232,9 +619,13 @@ def main():
         print(f"REFUSED  {args.method}+fb={args.fb}: {e}")
         return 0                                   # a refusal is a correct outcome, not a failure
     ok = write_row(args.out_csv, row)
+    score = (f"{row['task_metric_name']}={row['task_metric']:.4f}"
+             if row.get("task_metric") is not None else
+             f"ppl={row['perplexity']:.3f}" if row.get("perplexity") is not None else "score=n/a")
     print(f"{'OK ' if ok else 'CSV-FAIL '} {args.method}{'+fb' if args.fb else '':<4} "
           f"peak={row['train_step_peak_alloc_mib']:.2f} floor={row['resident_floor_mib']:.2f} "
-          f"ppl={row['perplexity']:.3f} engaged={row['engagement_ok']} -> {args.out_csv}")
+          f"{score} preds={row.get('pred_distribution')} "
+          f"engaged={row['engagement_ok']} -> {args.out_csv}")
     return 0 if ok else 1
 
 

@@ -229,23 +229,14 @@ def _encode_string_label_split(ds, s1_key, s2_key, label_field, class_names):
     return ds.cast_column("label", ClassLabel(names=class_names))
 
 
-def _load_results_df(results_file: str, columns: List[str]) -> pd.DataFrame:
-    if os.path.isfile(results_file):
-        df = pd.read_csv(results_file)
-        for c in columns:
-            if c not in df.columns:
-                df[c] = np.nan
-        return df[columns]
-    return pd.DataFrame(columns=columns)
-
-
-def _upsert_result(df: pd.DataFrame, comb_cols: List[str], row_dict: Dict) -> pd.DataFrame:
-    mask = reduce(
-        operator.and_, [(df[col] == row_dict[col]) for col in comb_cols], pd.Series(True, index=df.index)
-    )
-    df = df[~mask]
-    df = pd.concat([df, pd.DataFrame([row_dict])], ignore_index=True)
-    return df
+# The CSV upsert lives in `results_csv.py`, which imports pandas and filelock and NOTHING else.
+# It was moved out of this module because every writer paid for THIS module's scope -- galore_torch
+# (:82), lion_pytorch (:98), adapters (:101) and torch -- to write one row: 7.7 s and 1.0 GiB RSS,
+# and it is what killed three fir preflight jobs AFTER their training had succeeded. Re-exported
+# here so every existing `from train_glue import write_result_row` keeps working unchanged.
+from results_csv import (  # noqa: E402,F401
+    _load_results_df, _upsert_result, write_result_row,
+)
 
 
 ###############################################################################
@@ -2721,31 +2712,6 @@ def _read_partial_results(partial_dir: str) -> List[Dict]:
     return out
 
 
-def write_result_row(results_file: str, all_columns: List[str], comb_cols: List[str],
-                     result_row: Dict) -> bool:
-    """Hardened, atomic, lock-protected upsert of one row into the results CSV."""
-    lock_file = results_file + ".lock"
-    os.makedirs(os.path.dirname(os.path.abspath(results_file)), exist_ok=True)
-    lock = FileLock(lock_file, timeout=300)
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            with lock:
-                logger.info(f"Acquired lock on {lock_file} (attempt {attempt + 1}).")
-                df_results = _load_results_df(results_file, all_columns)
-                df_results = _upsert_result(df_results, comb_cols, result_row)
-                # Atomic write: write to temp file then rename
-                tmp_file = results_file + f".tmp.{os.getpid()}"
-                df_results.to_csv(tmp_file, index=False)
-                os.replace(tmp_file, results_file)
-                logger.info(f"Released lock. Logged Mo5 median results to {results_file}")
-            return True
-        except Timeout:
-            wait = 2 ** attempt + random.uniform(0, 1)
-            logger.warning(f"Lock timeout on attempt {attempt + 1}/{max_retries}. Retrying in {wait:.1f}s...")
-            time.sleep(wait)
-    logger.error(f"Failed to acquire lock on {lock_file} after {max_retries} attempts. Results NOT saved.")
-    return False
 
 
 def build_result_row(args, per_seed_results: List[Dict], total_training_time_sec: float,

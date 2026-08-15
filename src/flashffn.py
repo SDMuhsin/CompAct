@@ -32,6 +32,15 @@ import fb_offload as _fb_offload  # noqa: E402
 from fb_offload import (  # noqa: E402  -- re-exported so callers use one module
     fb_offload_enable, fb_offload_enabled, fb_offload_stats,
 )
+# Pinned-host residency for the FROZEN BASE WEIGHTS (WP-E).  Same separation of concerns as
+# `fb_offload`: pure stream/buffer plumbing, no autograd, and the mechanism is DeepSpeed
+# ZeRO-Offload's / accelerate's rather than ours.  Direction is the opposite one -- weights coming
+# IN, H2D only, same bytes every step, never modified.
+import fb_wstream as _fb_wstream  # noqa: E402
+from fb_wstream import (  # noqa: E402
+    fb_wstream_enable, fb_wstream_enabled, fb_wstream_alloc_stream, fb_wstream_lookahead,
+    fb_wstream_bwd, fb_wstream_parts, fb_wstream_fault, fb_wstream_stats,
+)
 
 
 # =============================================================================
@@ -3174,11 +3183,26 @@ class FusedLoRABlockFunction(torch.autograd.Function):
             o_h = lse = None
             ctx.flash_meta = None
 
+        # ------------------------------------------------- WP-E: base weights are NOT saved when
+        # they are being streamed.  `SavedVariable` takes a shallow copy that holds the STORAGE, so
+        # a staged landing slab saved here would stay alive from this forward to this block's
+        # backward -- all 22 layers resident, i.e. no saving at all.  The seven frozen `w` are
+        # therefore saved as `None` and the backward re-acquires them from `fb_wstream`, which is
+        # sound precisely because they are FROZEN: nothing writes them (so no version counter is
+        # needed) and they produce no gradient.  `install()` refuses a model with a trainable base
+        # weight, so there is no configuration in which this drops a `w` that backward needs to
+        # differentiate.
+        _wsc = _fb_wstream.current()
+        ctx.wstream = _wsc
+        if _wsc is None:
+            _sq, _sk, _sv, _so, _sg, _su, _sd = wq, wk, wv, wo, wg, wu, wd
+        else:
+            _sq = _sk = _sv = _so = _sg = _su = _sd = None
         ctx.save_for_backward(
             x, w_norm1, w_norm2, cos, sin,
-            wq, aq, bq, mq, nuq, wk, ak, bk, mk, nuk, wv, av, bv, mv, nuv,
-            wo, ao, bo, mo, nuo, wg, ag, bg, mg, nug, wu, au, bu, mu, nuu,
-            wd, ad, bd, md, nud,
+            _sq, aq, bq, mq, nuq, _sk, ak, bk, mk, nuk, _sv, av, bv, mv, nuv,
+            _so, ao, bo, mo, nuo, _sg, ag, bg, mg, nug, _su, au, bu, mu, nuu,
+            _sd, ad, bd, md, nud,
             biq, bik, biv, bio, big, biu, bid,
             xa_q, xa_k, xa_v, xa_o, xa_g, xa_u, xa_d,
             xn1, q, k, v, o_h, lse, x_mid, xn2, h_gate, h_up, rstd1, rstd2,
@@ -3211,6 +3235,18 @@ class FusedLoRABlockFunction(torch.autograd.Function):
         sq, sk, sv, so, sg, su, sd = ctx.scales
         keep, scale, eps = ctx.keep, ctx.scale, ctx.eps
         plan = ctx.plan
+
+        # WP-E: the seven frozen base weights were saved as `None`; bring this layer's slab back
+        # before anything reads them.  `bwd_enter` also issues the H2D for the NEXT block the
+        # backward will reach (layers run in reverse, so that is layer i-1), which is what gives
+        # the transfer a whole layer backward to arrive in.  If it has not arrived, the compute
+        # stream waits on the event -- a slowdown, not a wrong answer -- and
+        # `fb_wstream_stats()['blocked_acquires']` counts every time it happens, so a serialised
+        # run cannot be reported as an overlapped one.
+        _ws = getattr(ctx, "wstream", None)
+        if _ws is not None:
+            _wsx, _wsi = _ws
+            wq, wk, wv, wo, wg, wu, wd = _wsx.bwd_enter(_wsi)
 
         ngi = ctx.needs_input_grad
         # slot layout: 5 leading, then 5 slots (w, a, b, m, nu) per projection in q k v o g u d
@@ -3283,6 +3319,14 @@ class FusedLoRABlockFunction(torch.autograd.Function):
         if h_gate is None:
             h_gate, xa_g, raw_g = _fb_proj(xn2_2, wg, ag, bg, sg, big, cg, nm[4])
             h_up, xa_u, raw_u = _fb_proj(xn2_2, wu, au, bu, su, biu, cu, nm[5])
+        if _ws is not None and _fb_wstream._WS["bwd"] == "split":
+            # The recompute is done and the dgrad has not started.  `split` drops the slab here and
+            # re-acquires it below, so the layer is streamed THREE times per step instead of twice.
+            # It buys nothing: both halves read all seven weights, so the maximum number of
+            # concurrently-live slabs is unchanged and only the H2D bill goes up.  Kept because the
+            # measurement is the answer to "stream three times or hold across the backward".
+            _wsx.bwd_split_release(_wsi)
+            wq, wk, wv, wo, wg, wu, wd = _wsx.bwd_split_acquire(_wsi)
 
         def _raw(stored, x2, w_, a_, b_, s_, bias_, c_):
             """The PRE-DoRA-scale projection output, for `dL/dm = sum_rows(dL/dh * raw)/nu`.
@@ -3521,6 +3565,11 @@ class FusedLoRABlockFunction(torch.autograd.Function):
             out[_FB_W0 + 1 + 5 * p] = ga
             out[_FB_W0 + 2 + 5 * p] = gb
             out[_FB_W0 + 3 + 5 * p] = g_m
+        if _ws is not None:
+            # Every read of this layer's slab has now been ISSUED on the compute stream, which is
+            # the edge `bwd_exit`'s `record_stream` records.  Nothing in `out` references a base
+            # weight (all seven `gw[p]` are None under a frozen base, asserted above).
+            _wsx.bwd_exit(_wsi)
         return tuple(out)
 
 
@@ -3738,12 +3787,28 @@ def _fb_make_forward(layer, cfg, n_heads, n_kv_heads, head_dim):
     def fused_forward(hidden_states, attention_mask=None, position_ids=None, past_key_value=None,
                       output_attentions=False, use_cache=False, cache_position=None,
                       position_embeddings=None, **kwargs):
+        # WP-E.  Resolved here, not latched: `fb_wstream_enable` may be toggled between forwards by
+        # a bisection probe, and a cached decision would be exactly the kind of silent
+        # configuration drift this project has been bitten by.
+        wsx = _fb_wstream.streamer()
+        li = getattr(cfg, "layer_idx", None)
+        if wsx is not None and li is None:
+            raise RuntimeError("fb_wstream: patched layer has no layer_idx; re-patch the model.")
         if not (layer.training and torch.is_grad_enabled()):
-            return orig_forward(
-                hidden_states, attention_mask=attention_mask, position_ids=position_ids,
-                past_key_value=past_key_value, output_attentions=output_attentions,
-                use_cache=use_cache, cache_position=cache_position,
-                position_embeddings=position_embeddings, **kwargs)
+            # The unfused fall-back reads the base weights straight off the modules, and under
+            # streaming those live on the host.  Stage the layer for the call and hand it back --
+            # `no_grad`, so nothing can have saved the slab and it dies at `fwd_exit`.
+            if wsx is not None:
+                wsx.fwd_enter(li)
+            try:
+                return orig_forward(
+                    hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                    past_key_value=past_key_value, output_attentions=output_attentions,
+                    use_cache=use_cache, cache_position=cache_position,
+                    position_embeddings=position_embeddings, **kwargs)
+            finally:
+                if wsx is not None:
+                    wsx.fwd_exit(li, for_backward=False)
         if position_embeddings is None:
             raise RuntimeError("FusedLoRABlock: transformers must supply position_embeddings.")
         cos, sin = position_embeddings
@@ -3763,6 +3828,11 @@ def _fb_make_forward(layer, cfg, n_heads, n_kv_heads, head_dim):
         plan = _fb_mask_plan(attention_mask, hidden_states.shape[0], hidden_states.shape[1],
                              hidden_states.device)
 
+        # WP-E: the slab must be resident BEFORE `_fb_factors` runs -- it reads `base.weight` off
+        # the module (and DoRA computes its column norm from it), so the acquire has to precede the
+        # factor extraction, not just the `.apply()`.
+        if wsx is not None:
+            wsx.fwd_enter(li)
         sa, mlp = layer.self_attn, layer.mlp
         # Re-extracted on EVERY forward, never cached: parameters move between optimizer steps,
         # DoRA's column norm tracks A/B, AdaLoRA's mask and ranknum move on a schedule, and
@@ -3800,7 +3870,18 @@ def _fb_make_forward(layer, cfg, n_heads, n_kv_heads, head_dim):
                       f"O(S^2) attention recompute: {_why}", flush=True)
         args += [n_heads, n_kv_heads, head_dim, cfg.eps, keep, plan]
         assert len(args) == _FB_NARGS, (len(args), _FB_NARGS)
-        out = FusedLoRABlockFunction.apply(*args)
+        # `(streamer, layer_idx)` is handed to the Function through a module global rather than an
+        # argument slot, because `_FB_NARGS` is a published contract and every arg slot maps to a
+        # gradient slot.  It is set immediately before `.apply()` and cleared immediately after, in
+        # a `finally`, so a raising forward cannot leave a stale pair for the next layer -- and
+        # `forward` reads it synchronously, on the same host thread, one statement later.
+        _fb_wstream.set_current(None if wsx is None else (wsx, li))
+        try:
+            out = FusedLoRABlockFunction.apply(*args)
+        finally:
+            _fb_wstream.set_current(None)
+            if wsx is not None:
+                wsx.fwd_exit(li)
         return (out,)
 
     return fused_forward
@@ -4000,12 +4081,18 @@ def apply_flash_block(model, keep="min", verbose=False, auto_seq=None, announce=
     for i, layer in enumerate(layers):
         _fb_check_layer(layer, i, config, eps)
         cfg = FusedLoRABlock(keep=keep, eps=eps, auto_seq=auto_seq)
+        cfg.layer_idx = i                     # WP-E: which slab this layer streams
         layer._flash_block = cfg
         layer.forward = _fb_make_forward(layer, cfg, n_heads, n_kv_heads, head_dim)
         patched += 1
     if patched == 0:
         raise ValueError("FusedLoRABlock: 0 decoder layers patched")
     _FB_COUNTERS["patched_layers"] = patched
+    # WP-E.  Installed LAST, after every architecture guard has passed, so a model that refuses to
+    # patch never has 2 GiB of its weights pinned as a side effect.
+    if _fb_wstream.fb_wstream_enabled():
+        _fb_wstream.install(model, inner, layers, _FB_PROJ_NAMES, _fb_base_layer,
+                            verbose=True)
     if _FB_CERT["on"]:
         # A detector whose verdict can go unread is the silent failure it exists to remove. The
         # per-block comparisons are device-side and never synchronise; this hook is the ONE read,

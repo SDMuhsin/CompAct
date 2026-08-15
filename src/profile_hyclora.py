@@ -482,6 +482,63 @@ def apply_family(model, family, r):
     raise ValueError(family)
 
 
+def load_base_model(cfg, **kw):
+    """Load the base model with whatever HEAD the run needs. THE single construction site.
+
+    Every builder below used to call `AutoModelForCausalLM.from_pretrained` directly, which is why
+    `run_production.py` refused `--task glue:*` outright: the registry could build nine methods but
+    only one head, so a GLUE row would have measured the wrong model. Routing all eight sites
+    through here is what parameterises the campaign by task.
+
+    ⚠ THE DEFAULT IS BYTE-IDENTICAL TO WHAT EVERY BUILDER DID BEFORE. A `cfg` with no "head" key
+    resolves to `causal_lm` and forwards **kw unchanged, so every memory and throughput number
+    already measured (CONTEXT.md §4.1, §16) is reproduced by the same call it was produced by. Do
+    not add behaviour to the causal_lm branch.
+
+    cfg keys read here, all optional except on the seq_cls path:
+      head        "causal_lm" (default) | "seq_cls"
+      num_labels  REQUIRED for seq_cls; 1 means regression (stsb)
+      task_name   recorded in the config as `finetuning_task`
+      pad_token_id  set on the config -- ⚠ MANDATORY for a decoder classifier, see below
+    """
+    import torch                                        # noqa: F811  (local, as in every builder)
+    head = cfg.get("head") or "causal_lm"
+
+    if head == "causal_lm":
+        from transformers import AutoModelForCausalLM
+        return AutoModelForCausalLM.from_pretrained(cfg["model"], **kw)
+
+    if head == "seq_cls":
+        from transformers import AutoConfig, AutoModelForSequenceClassification
+        num_labels = cfg.get("num_labels")
+        if not num_labels:
+            raise ValueError("cfg['head']=='seq_cls' needs cfg['num_labels'] "
+                             "(1 for a regression task such as stsb)")
+        config = AutoConfig.from_pretrained(
+            cfg["model"], num_labels=num_labels, finetuning_task=cfg.get("task_name"))
+        model = AutoModelForSequenceClassification.from_pretrained(
+            cfg["model"], config=config, **kw)
+        # ⚠ pad_token_id IS REQUIRED, AND HERE IS THE MEASURED REASON (checked against the
+        #   installed transformers 4.51.3, `modeling_llama.py:922-938`, not from memory):
+        #     if self.config.pad_token_id is None and batch_size != 1:
+        #         raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        #   `LlamaForSequenceClassification` pools the LAST NON-PAD token, located by comparing
+        #   input_ids against `config.pad_token_id`. Llama ships that as None, so at our batch 2
+        #   the forward RAISES -- loudly, which is the good case. The silent case is narrower than
+        #   it looks: only at batch_size == 1 does it fall back to position -1 and pool a PAD
+        #   token. Either way the config value is what makes the classifier correct.
+        #   `train_glue.py:1715` sets it too; matched here so both harnesses build one classifier.
+        pad = cfg.get("pad_token_id")
+        if pad is None:
+            raise ValueError("cfg['head']=='seq_cls' needs cfg['pad_token_id'] -- "
+                             "LlamaForSequenceClassification pools at the last non-pad token and "
+                             "silently pools at a PAD token without it")
+        model.config.pad_token_id = pad
+        return model
+
+    raise ValueError(f"unknown cfg['head']={head!r}; expected 'causal_lm' or 'seq_cls'")
+
+
 def build_qlora_model(arm, cfg, device, use_cache=False):
     """QLoRA (Dettmers et al., NeurIPS 2023) -- NOT reimplemented.
 
@@ -539,8 +596,8 @@ def build_qlora_model(arm, cfg, device, use_cache=False):
 
     quant_type = "fp4" if "_fp4" in arm else "nf4"
     double_quant = "_nodq" not in arm
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"],
+    model = load_base_model(
+        cfg,
         attn_implementation="sdpa",          # §C R1: matched backend against our `_sdpa` arms
         torch_dtype=torch.bfloat16,
         quantization_config=BitsAndBytesConfig(
@@ -626,15 +683,14 @@ def build_minis_model(arm, cfg, device, use_cache=False):
        (`grad_liveness.PASS`, `n_dead_gradients`) is the receipt either way.
     """
     import torch
-    from transformers import AutoModelForCausalLM
 
     _minis = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp", "minis")
     if _minis not in sys.path:
         sys.path.insert(0, _minis)
     from minis.mini_sequence import minisequence
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"], attn_implementation="sdpa", torch_dtype=torch.bfloat16)
+    model = load_base_model(
+        cfg, attn_implementation="sdpa", torch_dtype=torch.bfloat16)
     model.config.use_cache = False
     model = apply_family(model, "lora", cfg["lora_r"])
     model.to(device=device, dtype=torch.bfloat16)
@@ -666,15 +722,14 @@ def build_lomo_model(arm, cfg, device, use_cache=False):
     recommendation, "AdaLomo without gradnorm ... better performance and higher throughput").
     """
     import torch
-    from transformers import AutoModelForCausalLM
 
     _l = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp", "lomo")
     if _l not in sys.path:
         sys.path.insert(0, _l)
     from lomo_optim import Lomo, AdaLomo
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"], attn_implementation="sdpa", torch_dtype=torch.bfloat16)
+    model = load_base_model(
+        cfg, attn_implementation="sdpa", torch_dtype=torch.bfloat16)
     model.config.use_cache = False
     for p in model.parameters():
         p.requires_grad_(True)                        # full fine-tuning -- their regime
@@ -719,15 +774,14 @@ def build_galore_model(arm, cfg, device, use_cache=False):
     embeddings, biases) goes in a plain group. `GaLoreAdamW` is then constructed over both.
     """
     import torch
-    from transformers import AutoModelForCausalLM
 
     _g = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp", "galore")
     if _g not in sys.path:
         sys.path.insert(0, _g)
     from galore_torch import GaLoreAdamW  # noqa: F401  (constructed at the optimizer site)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"], attn_implementation="sdpa", torch_dtype=torch.bfloat16)
+    model = load_base_model(
+        cfg, attn_implementation="sdpa", torch_dtype=torch.bfloat16)
     model.config.use_cache = False
     for p in model.parameters():
         p.requires_grad_(True)                       # full fine-tuning -- their regime
@@ -792,7 +846,6 @@ def build_alst_model(arm, cfg, device, use_cache=False):
     import torch
     import torch.distributed as dist
     import importlib.util
-    from transformers import AutoModelForCausalLM
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ds_alst = os.path.join(root, "temp", "ds_alst")
@@ -823,8 +876,8 @@ def build_alst_model(arm, cfg, device, use_cache=False):
         dist.init_process_group(backend="nccl", rank=0, world_size=1)
 
     _mod.enable_tiled_mlp_compute(cfg["model"])     # their entry point, patches the class
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"], attn_implementation="sdpa", torch_dtype=torch.bfloat16)
+    model = load_base_model(
+        cfg, attn_implementation="sdpa", torch_dtype=torch.bfloat16)
     model.config.use_cache = False
     model = apply_family(model, "lora", cfg["lora_r"])
     model.to(device=device, dtype=torch.bfloat16)
@@ -876,7 +929,6 @@ def build_streambp_model(arm, cfg, device, use_cache=False):
        with Mini-Sequence. Guarded in `profile_unsloth.build_other`.
     """
     import torch
-    from transformers import AutoModelForCausalLM
 
     # `streambp/__init__.py` imports their DPO/GRPO/SFT trainers, which import `trl`. Installing
     # trl here is not safe: it pins/upgrades `transformers`, and every published number in this
@@ -894,8 +946,8 @@ def build_streambp_model(arm, cfg, device, use_cache=False):
     _, _, tail = arm.partition(":")
     chunk = int(tail) if tail.isdigit() else max(1, seq // 3)
 
-    llama = AutoModelForCausalLM.from_pretrained(
-        cfg["model"], attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+    llama = load_base_model(
+        cfg, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
     llama.config.use_cache = False
     apply_family(llama, "lora", cfg["lora_r"])       # mutates `llama` in place; see (1)
     llama.to(device=device, dtype=torch.bfloat16)
@@ -955,7 +1007,6 @@ def build_zero3_model(arm, cfg, device, use_cache=False):
         loss, which would move the quality column without moving the memory column.
     """
     import torch
-    from transformers import AutoModelForCausalLM
     import deepspeed
 
     if not torch.distributed.is_initialized():
@@ -984,8 +1035,8 @@ def build_zero3_model(arm, cfg, device, use_cache=False):
     if offload:
         ds_config["zero_optimization"]["offload_param"] = {"device": "cpu", "pin_memory": True}
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"], attn_implementation="sdpa", torch_dtype=torch.bfloat16)
+    model = load_base_model(
+        cfg, attn_implementation="sdpa", torch_dtype=torch.bfloat16)
     model.config.use_cache = False
     model = apply_family(model, "lora", cfg["lora_r"])
     model.config.use_cache = bool(use_cache)
@@ -1019,9 +1070,47 @@ def build_model(arm, cfg, device, adapter_dtype="bf16", use_cache=False):
         'fp32' -- adapters left in PEFT's default fp32, which is what `train_glue.py` actually
                   runs for every non-HyC-LoRA arm (it never re-casts after `get_peft_model`).
     """
-    from transformers import AutoModelForCausalLM
 
     arm, family = arm_family(arm)
+    # ⚠⚠ THIS BLOCK MUST STAY ABOVE THE FIRST DISPATCH. Every specialised builder below
+    #    (`qlora`, `minis`, `lomo`, `galore`, `alst`, `streambp`, `zero3`) RETURNS, so anything
+    #    placed after them runs for the generic `fb_*`/`hyclora*` arms only. It sat below them
+    #    until 2026-08-14, which meant a COMPOSED arm (`lomo_fb`, `galore_fb`, `adalomo_fb`)
+    #    (a) never got the process-global offload/streamer state reset -- so a buffer or a 2 GiB
+    #    pinned slab from a previous arm in the same process could land in its measurement -- and
+    #    (b) could never enable weight streaming, because the parse never executed. Caught by the
+    #    streamer-install assertion in run_production, which refused to write three rows rather
+    #    than claim a mechanism that had not run.
+    # Clear the `o_h` staging state for EVERY arm, not just fused-block ones.  `fb_offload`'s
+    # buffer pools are process-global, so a landing buffer left over from an offloaded arm stays
+    # resident while the next arm is measured and lands in its peak -- 64.00 MiB on both `fb_attn`
+    # and `fb_min` at seq 4096 before this existed, which is enough to move a published column.
+    import fb_offload as _fbo
+    _fbo.reset()
+    _fbo.fb_offload_enable(False)
+    # Same argument for WP-E's weight streamer, and stronger: a streamer left installed from the
+    # previous arm still holds ~2 GiB of PINNED HOST memory and still has hooks on a dead model.
+    import fb_wstream as _fbw
+    _fbw.reset()
+    _fbw.fb_wstream_enable(False)
+    # `_wstream` keeps the FROZEN base weights in pinned host memory and streams each layer's slab
+    # in just before that layer needs it (WP-E).  The mechanism is DeepSpeed ZeRO-Offload's /
+    # accelerate `device_map`'s, not ours.  Parsed HERE, at the top of the dispatcher, rather than
+    # inside the generic `fb_*` branch: the COMPOSED arms (`lomo_fb`, `galore_fb`, `adalomo_fb`)
+    # call `apply_flash_block` from their own builders and would otherwise never see the flag.
+    # Enabling is safe this early because `install()` runs at the END of the patcher, once every
+    # architecture guard has passed.
+    #   _wstream          layers + embed + head streamed, lookahead 1, one staging per phase
+    #   _wstreamnh        ... lm_head left RESIDENT
+    #   _wstreamne        ... embed_tokens left RESIDENT
+    #   _wstreamsplit     ... three stagings per layer per step instead of two
+    #   _wstreamL<k>      ... prefetch depth k
+    if "wstream" in arm:
+        _fbw.fb_wstream_parts(embed="wstreamne" not in arm, head="wstreamnh" not in arm)
+        _fbw.fb_wstream_bwd("split" if "wstreamsplit" in arm else "hold")
+        _lm = re.search(r"wstreamL(\d+)", arm)
+        _fbw.fb_wstream_lookahead(int(_lm.group(1)) if _lm else 1)
+        _fbw.fb_wstream_enable(True)
     if arm.startswith("qlora"):
         if family != "lora":
             raise ValueError(f"{arm!r}: QLoRA is defined over plain LoRA only; "
@@ -1074,21 +1163,14 @@ def build_model(arm, cfg, device, adapter_dtype="bf16", use_cache=False):
         engine, _zreceipt = build_zero3_model(arm, cfg, device, use_cache=use_cache)
         engine._zero3_receipt = _zreceipt
         return engine
-    # Clear the `o_h` staging state for EVERY arm, not just fused-block ones.  `fb_offload`'s
-    # buffer pools are process-global, so a landing buffer left over from an offloaded arm stays
-    # resident while the next arm is measured and lands in its peak -- 64.00 MiB on both `fb_attn`
-    # and `fb_min` at seq 4096 before this existed, which is enough to move a published column.
-    import fb_offload as _fbo
-    _fbo.reset()
-    _fbo.fb_offload_enable(False)
     # HyC-LoRA's FA variant expresses causality with `is_causal`, so it must NOT be handed a 4-D
     # additive mask; loading with sdpa makes transformers pass `attention_mask=None` for an
     # unpadded batch, which is exactly what that path wants. (`patch.py` validates this and
     # raises if a real padding pattern ever shows up.)
     attn_impl = ("sdpa" if (arm.endswith("_sdpa") or arm.startswith("hyclora_flash")
                             or arm.startswith("fb_")) else "eager")
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model"], attn_implementation=attn_impl, torch_dtype=torch.bfloat16,
+    model = load_base_model(
+        cfg, attn_implementation=attn_impl, torch_dtype=torch.bfloat16,
     )
     model.config.use_cache = False
     model = apply_family(model, family, cfg["lora_r"])

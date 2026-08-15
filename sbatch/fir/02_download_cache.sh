@@ -10,7 +10,11 @@
 #      ./data symlink, never on /project (inode budget, see fir_env.sh)
 #   2. adds MMLU (`cais/mmlu`, config "all"), which the commonsense-MC paradigm
 #      now supports as an extra eval set
-#   3. SuperGLUE is NOT downloaded — dropped from scope on 2026-08-11
+#   3. ⚠ SuperGLUE IS downloaded again. This line used to read "SuperGLUE is NOT
+#      downloaded — dropped from scope on 2026-08-11", and that became false when
+#      `--task glue:{boolq,cb}` landed: `train_glue.py:2340` and
+#      `run_production.build_glue_data` both route those two tasks to SuperGLUE.
+#      Only the METRIC was ever cached, so the datasets were missing entirely.
 #
 # ⚠ THIS MUST COMPLETE BEFORE ANY JOB IS SUBMITTED. A compute node with
 #   HF_HUB_OFFLINE=1 and a cold cache does not fail fast: `evaluate.load()` alone
@@ -77,6 +81,29 @@ for m in ["TinyLlama/TinyLlama-1.1B-Chat-v1.0", "huggyllama/llama-7b", "Qwen/Qwe
 print("\n=== GLUE ===")
 for t in ["cola", "mrpc", "sst2", "rte", "qnli", "stsb"]:
     retry(lambda t=t: load_dataset("glue", t), f"glue/{t}")
+
+# ⚠ THE SUPERGLUE **DATASETS**, WHICH WERE MISSING ENTIRELY. Only the super_glue METRIC and the
+#   unrelated `google/boolq` (the commonsense-MC mirror, a different repo with a different schema)
+#   were cached, so `--task glue:boolq` / `glue:cb` -- which call `load_dataset` for the SuperGLUE
+#   config -- would have failed offline on a compute node with "Couldn't find a module script".
+#   datasets>=4 dropped script-based loading, and this project's cache is split across two repo
+#   names: `boolq` resolves under `aps/super_glue`, `cb` under `super_glue`. Try the same candidate
+#   list `run_production.build_glue_data` uses, and report WHICH ONE answered so the sweep and the
+#   cache agree on provenance.
+print("\n=== SuperGLUE (for --task glue:boolq / glue:cb) ===")
+for t in ["boolq", "cb"]:
+    got = None
+    for cand in ("aps/super_glue", "super_glue"):
+        try:
+            retry(lambda c=cand, t=t: load_dataset(c, t), f"{cand}/{t}", n=2)
+            got = cand
+            break
+        except Exception as e:
+            print(f"   {cand}/{t} unavailable: {type(e).__name__}: {str(e)[:100]}")
+    if got:
+        print(f"   OK  superglue/{t} <- {got}")
+    else:
+        print(f"   ⚠ superglue/{t} UNAVAILABLE FROM EVERY CANDIDATE -- `--task glue:{t}` will fail")
 
 print("\n=== language modelling ===")
 retry(lambda: load_dataset("wikitext", "wikitext-2-raw-v1"), "wikitext-2")
@@ -161,6 +188,17 @@ for args, label in [(("glue","rte"),"glue/rte"), (("cais/mmlu","all"),"mmlu"),
     try:
         load_dataset(*args); print(f"  {label} offline: OK")
     except Exception as e: fails.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
+# ⚠ The SuperGLUE DATASETS, offline, through the same candidate list the runner uses. Verifying the
+#   metric alone (below) passed for months while the dataset was never cached at all.
+for t in ["boolq", "cb"]:
+    ok = False
+    for cand in ("aps/super_glue", "super_glue"):
+        try:
+            load_dataset(cand, t); print(f"  superglue/{t} offline: OK (via {cand})"); ok = True; break
+        except Exception:
+            pass
+    if not ok:
+        fails.append(f"superglue/{t}: no cached candidate resolves it -> --task glue:{t} will fail")
 # ⚠ VERIFY THE METRIC THE TASKS ACTUALLY LOAD, NOT THE ONE THAT IS EASY TO LOAD.
 #   This block used to check `evaluate.load("accuracy")` alone — which passed on fir
 #   2026-08-14 while the GLUE metric had never been cached at all, because the

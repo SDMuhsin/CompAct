@@ -89,6 +89,55 @@ FB_COMPAT: Dict[str, Dict] = {
 # FLCE on top would be two implementations of one optimisation and would measure neither.
 FLCE_FORBIDDEN = ("minis", "streambp")
 
+# ---------------------------------------------------------------------------------------------
+# HEAD compatibility. MEASURED 2026-08-14 by running all 13 arms on `glue:sst2` (phase 1 of
+# `validate_glue_runner.py`); 12 of 13 built and trained on a sequence-classification head.
+#
+# ⚠ THIS IS A METHOD-LEVEL FACT, NOT A MISSING FEATURE. Declaring it here means the sweep refuses
+#   the cell before building a model, the same way FB_COMPAT does -- rather than discovering it as
+#   an AttributeError 40 frames down, after the dataset has been tokenised and the model loaded.
+# ---------------------------------------------------------------------------------------------
+SEQ_CLS_REFUSES = {
+    "streambp":
+        "StreamBP's mechanism IS the chunked LM head: `stream_model.py:622-629` reads "
+        "`model.lm_head.weight.grad` and evaluates `model.lm_head(hidden[:, start:end, :])` "
+        "chunk by chunk along the SEQUENCE. `LlamaForSequenceClassification` has no `lm_head` -- "
+        "it has `score`, and it emits ONE logit vector per sequence, not one per token, so there "
+        "is nothing to chunk. Observed: `AttributeError: 'LlamaForSequenceClassification' object "
+        "has no attribute 'lm_head'`. This is not an unimplemented feature; the method does not "
+        "apply to sentence classification and must be reported absent, with this reason.",
+}
+
+
+def resolve_fb_variant(method: str, with_fb: bool, fb_variant: str) -> None:
+    """Raise `CombinationRefused` if the fused-block VARIANT cannot apply to this method.
+
+    ⚠ WP-E (`wstream`) STREAMS THE **FROZEN** BASE WEIGHTS, so it is structurally incompatible with
+    every full-fine-tuning arm. MEASURED 2026-08-14: `lomo_fb_wstream`, `galore_fb_wstream` and
+    `adalomo_fb_wstream` all reach `fb_wstream.install()` and are declined with
+    `'layers [0..21] have TRAINABLE base weights'`.
+
+    The refusal is not incidental -- it is what makes the mechanism correct. The block saves the
+    seven base weights as `None` and re-acquires them in the backward, which is sound ONLY because
+    nothing writes them (no version counter needed) and they carry no gradient. Under full FT the
+    optimizer writes them and they do produce gradients, so streaming them would be wrong, not
+    merely unsupported.
+    """
+    if with_fb and fb_variant == "wstream" and method in FULL_FT_REGIME:
+        raise CombinationRefused(
+            f"{method} + fb_variant=wstream: WP-E streams the FROZEN base weights, and {method} is "
+            f"a FULL fine-tuning method whose base weights are all trainable "
+            f"(fb_wstream.install declines: 'layers have TRAINABLE base weights'). The frozen-ness "
+            f"is what makes saving them as None and re-acquiring them in the backward correct, so "
+            f"this is a structural incompatibility, not a missing feature. Use fb_variant=min.")
+
+
+def resolve_head(method: str, head: str) -> None:
+    """Raise `CombinationRefused` if `method` cannot be built on `head`. Called before any model
+    is constructed, so a refused cell costs nothing."""
+    if head == "seq_cls" and method in SEQ_CLS_REFUSES:
+        raise CombinationRefused(f"{method} + sequence-classification head: {SEQ_CLS_REFUSES[method]}")
+
 # Methods that train ALL parameters. Their rows answer "can I full-finetune cheaply?", NOT "whose
 # activation cache is smaller", and must never be tabulated beside a LoRA arm without this flag.
 FULL_FT_REGIME = ("galore", "lomo", "adalomo")
@@ -143,9 +192,21 @@ def _eng_qlora(model) -> Dict:
 
 
 def _eng_minis(model) -> Dict:
-    n = sum(1 for _n, m in model.named_modules()
-            if type(m).__name__ in ("LlamaMLPWarpper", "LlamaForCausalLMWarpper", "LMheadWarpper"))
-    return {"minis_wrapped_modules": n}
+    """⚠ COUNT THE TWO HALVES SEPARATELY. Mini-Sequence has two mechanisms -- per-token MLP tiling
+    (`LlamaMLPWarpper`) and chunking of the LM head + loss (`LlamaForCausalLMWarpper`/`LMheadWarpper`,
+    their headline memory claim). A single total hides which one ran.
+
+    MEASURED 2026-08-14 on `glue:sst2`: the total was 22 = the 22 decoder MLPs and NOTHING else,
+    because the model is a `LlamaForSequenceClassification` and their LM-head wrapper patches
+    `LlamaForCausalLM`. So on a classification head Mini-Sequence is HALF-ENGAGED: the MLP tiling is
+    genuinely theirs and genuinely running, the LM-head chunking cannot apply because there is no LM
+    head. That is a caveat a GLUE table must carry, and it is only visible if the counts are split.
+    """
+    mlp = sum(1 for _n, m in model.named_modules() if type(m).__name__ == "LlamaMLPWarpper")
+    head = sum(1 for _n, m in model.named_modules()
+               if type(m).__name__ in ("LlamaForCausalLMWarpper", "LMheadWarpper"))
+    return {"minis_mlp_wrappers": mlp, "minis_lm_head_wrappers": head,
+            "minis_wrapped_modules": mlp + head}
 
 
 def _eng_streambp(model) -> Dict:
@@ -232,6 +293,18 @@ def verify_engagement(model, methods, strict: bool = True) -> Dict:
 
     `methods` is the list of constituents, e.g. ['lomo', 'fb']. A zero counter is a hard error:
     a row whose method did not execute is worse than a missing row, because it looks like data.
+
+    ⚠ THE `_active` CONVENTION, ADDED 2026-08-14 AFTER IT LET AN INERT ARM THROUGH.
+    `any(counters)` treats every counter as equally good evidence, so a counter meaning "the patch
+    is INSTALLED" outvotes one meaning "the patch DID SOMETHING". Measured: `alst` on `glue:sst2`
+    at seq 128 reported `alst_mlp_forward_patched: 1, alst_num_shards: 1, alst_tiling_active: 0`
+    and passed -- ALST's own rule is `num_shards = ceil(seq/hidden)`, which is 1 on a 2048-hidden
+    model at any GLUE sequence length, i.e. their method configured itself to do nothing and we
+    wrote the row anyway. `_eng_alst`'s own docstring warned about exactly this failure and the
+    aggregator did not honour it.
+
+    **A counter whose name ends in `_active` is a LIVENESS counter: if it is present and zero, the
+    method is dead regardless of what any other counter says.**
     """
     counters: Dict = {}
     dead = []
@@ -239,7 +312,11 @@ def verify_engagement(model, methods, strict: bool = True) -> Dict:
         probe = _eng_fb if m == "fb" else REGISTRY[m].engagement
         c = probe(model)
         counters.update(c)
-        if not any(v for v in c.values()):
+        liveness = {k: v for k, v in c.items() if k.endswith("_active")}
+        if liveness:
+            if not all(liveness.values()):
+                dead.append(m)
+        elif not any(v for v in c.values()):
             dead.append(m)
     counters["engagement_ok"] = not dead
     if dead and strict:
