@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import statistics
 import sys
@@ -156,13 +157,158 @@ GLUE_DEFAULT_SEQ = 128                      # train_glue.py's own --max_length d
 TASK_MAX_LENGTH = {"boolq": 384}            # everything else takes GLUE_DEFAULT_SEQ
 
 
-def resolve_seq(explicit, is_glue, glue_name):
+# ==============================================================================================
+# CAUSAL-LM CORPORA — the benchmark family where EVERY baseline is actually engaged.
+# ==============================================================================================
+# ⚠ WHY THIS EXISTS, AND WHY A GLUE-ONLY TABLE IS NOT ENOUGH. A sequence-classification head
+#   structurally disables or degrades THREE of the eight published baselines, and it is not a
+#   fixable limitation of our integration -- it is what those methods are:
+#
+#     streambp  REFUSED outright. Its mechanism IS the chunked LM head; `LlamaForSequenceClassification`
+#               has `score`, one logit vector per sequence, nothing to chunk (SEQ_CLS_REFUSES).
+#     minis     HALF-ENGAGED. `_eng_minis` measured 22 MLP wrappers and ZERO LM-head wrappers on
+#               glue:sst2 -- their headline memory claim patches `LlamaForCausalLM` and cannot fire.
+#     alst      INERT. num_shards = ceil(seq/hidden); at GLUE lengths (128, or 384 for boolq) on a
+#               2048-hidden model that is 1, i.e. no tiling at all.
+#
+#   And `--flce` is refused on a GLUE head, so every GLUE row is regime A -- while §8 says regime B
+#   is "where competitor claims are adjudicated". A causal-LM corpus at a long sequence fixes all
+#   four at once: there is an `lm_head` to chunk, seq > hidden so ALST tiles, and FLCE applies.
+#
+#   wstream is unaffected either way -- it needs only FROZEN base weights, so it runs on every LoRA
+#   arm here exactly as it does on GLUE.
+LM_CORPORA = {
+    # name -> (hub id, config, text column, eval split)
+    # Both verified to load OFFLINE from ./data on 2026-08-15.
+    "wikitext2": ("wikitext", "wikitext-2-raw-v1", "text", "validation"),
+    "pg19":      ("emozilla/pg19", None, "text", "validation"),
+}
+
+# ⚠⚠ 2048, AND ALST CANNOT BE RESCUED ON THIS MODEL. MEASURED 2026-08-15, DO NOT RE-DERIVE.
+#
+#   I first set this to 4096 so that ALST would tile (their rule is `num_shards = ceil(seq/hidden)`,
+#   so seq must EXCEED the 2048 hidden size for a second shard to exist). That is invalid, because
+#   TinyLlama's `max_position_embeddings` is **also 2048** -- the two numbers coincide exactly --
+#   and running past it makes RoPE extrapolate into nonsense. Base-model WikiText-2 perplexity,
+#   no training, packed blocks:
+#
+#       seq  512 -> 10.634      seq 2048 -> 8.171
+#       seq 1024 ->  9.092      seq 4096 -> 149.918   <-- past the context limit
+#
+#   So on TinyLlama-1.1B the ALST-tiling requirement (seq > 2048) and the valid-perplexity
+#   requirement (seq <= 2048) are MUTUALLY EXCLUSIVE. ALST is therefore inapplicable to any
+#   quality benchmark on this model -- not through a task choice we could change, but because the
+#   model's context window is exactly its tiling threshold. Report it as such, citing both numbers.
+#   Measuring ALST's tiling needs a longer-context model; that is a model decision, not a task one.
+#
+#   ⚠ This limit binds QUALITY only. The §4.1 memory table legitimately runs to seq 16384 because
+#   it uses `lm:synthetic` random tokens, where the docstring already says the "perplexity" is a
+#   receipt that the step ran and NOT a quality number. Do not use this note to question those.
+LM_DEFAULT_SEQ = 2048
+
+
+def resolve_seq(explicit, is_glue, glue_name, is_lm_corpus=False):
     """(seq, source). `--seq` still wins when given; the policy fills in when it is not."""
     if explicit is not None:
         return explicit, "explicit"
     if is_glue:
         return TASK_MAX_LENGTH.get(glue_name, GLUE_DEFAULT_SEQ), "task_policy"
+    if is_lm_corpus:
+        return LM_DEFAULT_SEQ, "lm_policy"
     return 1024, "default"
+
+
+def build_lm_data(name, tokenizer, args):
+    """Load one causal-LM corpus and pack it into fixed `args.seq` blocks.
+
+    Returns (train_dl, eval_dl, sizes).
+
+    ⚠ CONCATENATE-AND-CHUNK, NOT PAD-AND-TRUNCATE. Perplexity is only comparable across arms if
+    every arm sees the same tokens in the same blocks, and a padded corpus would (a) make the
+    number depend on document boundaries and (b) put a variable amount of PAD in the loss. Packing
+    is what the wikitext-2 perplexity numbers in the literature assume, and it makes `seq` a
+    controlled variable rather than an upper bound -- which matters here because `seq` is the axis
+    ALST and the memory table both live on.
+
+    Labels are the input ids; the model's own shift-by-one supplies causality (LlamaForCausalLM
+    does the shift internally), so no manual shifting here -- doing it twice is a classic silent
+    off-by-one that leaves the loss plausible and the perplexity wrong.
+    """
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader, TensorDataset
+
+    if name not in LM_CORPORA:
+        raise KeyError(f"unknown lm corpus {name!r}; known: {sorted(LM_CORPORA)}")
+    hub_id, cfg_name, text_col, eval_split = LM_CORPORA[name]
+    raw = load_dataset(hub_id, cfg_name) if cfg_name else load_dataset(hub_id)
+
+    def pack(split, max_docs=None):
+        # ⚠ `"\n\n".join(non-blank rows)`, TOKENISED AS ONE STREAM. This is not a style choice --
+        #   it is the convention four already-validated probes in this repo use
+        #   (`smoke_v3_adapters.py:73`, `diag_hyclora_grads.py:71`, `codec_feasibility_v3.py:64`,
+        #   `probe_value_redundancy.py`) and it is what produces CONTEXT.md §5.1's WikiText-2
+        #   figure of 7.19 for this model.
+        #   The first version here tokenised ROW BY ROW and appended `eos_token_id` after each.
+        #   WikiText's rows are partial paragraphs, not documents, so that injected ~36k spurious
+        #   EOS into the stream and measured **perplexity 90.60 instead of ~7.2** -- a 12x error
+        #   that looks entirely plausible in isolation. A perplexity is only comparable against
+        #   published numbers if the token stream is built the same way.
+        ds = raw[split]
+        if max_docs:
+            ds = ds.select(range(min(max_docs, len(ds))))
+        texts = [t for t in ds[text_col] if t and t.strip()]
+        ids = tokenizer("\n\n".join(texts), add_special_tokens=False)["input_ids"]
+        n_blocks = len(ids) // args.seq
+        if n_blocks == 0:
+            raise ValueError(
+                f"lm:{name}/{split} yielded {len(ids)} tokens, fewer than one block of "
+                f"{args.seq}. Lower --seq or raise --max_train_samples.")
+        buf = torch.tensor(ids[:n_blocks * args.seq], dtype=torch.long).view(n_blocks, args.seq)
+        return buf
+
+    # ⚠ PG-19 IS ENORMOUS (28,602 books). Reading it whole to tokenise would take longer than the
+    #   training run and would OOM the host. `--max_train_samples`/`--max_eval_samples` cap the
+    #   DOCUMENT count here (they cap examples on GLUE), and the row records the block counts, so
+    #   what was actually trained on is always readable from the data.
+    train_blocks = pack("train", args.max_train_samples or (200 if name == "pg19" else None))
+    eval_blocks = pack(eval_split, args.max_eval_samples or (20 if name == "pg19" else None))
+
+    train_dl = DataLoader(TensorDataset(train_blocks), batch_size=args.batch,
+                          shuffle=True, drop_last=True)
+    eval_dl = DataLoader(TensorDataset(eval_blocks), batch_size=args.batch, drop_last=False)
+    # ⚠ `n_train`/`n_eval` are the names the GLUE path uses and the row reads. Blocks, not tokens
+    #   -- an "example" here is one packed block of `args.seq` tokens. Token counts travel too,
+    #   because "how much text did it see?" is not answerable from block count without `seq`.
+    sizes = {"n_train": int(train_blocks.shape[0]),
+             "n_eval": int(eval_blocks.shape[0]),
+             "n_train_tokens": int(train_blocks.numel()),
+             "n_eval_tokens": int(eval_blocks.numel()),
+             "dataset_source": hub_id, "eval_split": eval_split}
+    return train_dl, eval_dl, sizes
+
+
+@torch.no_grad()
+def evaluate_lm(model, eval_dl, device):
+    """Token-weighted mean NLL -> perplexity. Returns (ppl, mean_nll, n_tokens).
+
+    ⚠ TOKEN-WEIGHTED, NOT BATCH-AVERAGED. A mean of per-batch losses silently over-weights a short
+    final batch. Blocks are equal-length here so the two agree, but the eval loader keeps its
+    remainder (`drop_last=False`), so they would diverge the moment anyone changed the packing.
+    """
+    was_training = model.training
+    model.eval()
+    total_nll, total_tok = 0.0, 0
+    for (ids,) in eval_dl:
+        ids = ids.to(device)
+        out = model(input_ids=ids, labels=ids)
+        # HF averages over the (seq-1) predicted positions per sequence.
+        n_pred = ids.shape[0] * (ids.shape[1] - 1)
+        total_nll += float(out.loss) * n_pred
+        total_tok += n_pred
+    if was_training:
+        model.train()
+    mean_nll = total_nll / max(total_tok, 1)
+    return math.exp(min(mean_nll, 20.0)), mean_nll, total_tok
 
 # `stsb` is a REGRESSION task: one output, Pearson/Spearman, not accuracy. num_labels=1 is what
 # switches LlamaForSequenceClassification's loss to MSE (train_glue.py:1614).
@@ -305,6 +451,14 @@ def run_one(args) -> dict:
 
     is_glue = args.task.startswith("glue:")
     glue_name = args.task.split(":", 1)[1] if is_glue else None
+    # `lm:synthetic` stays what it always was -- a fixed random batch, computational metrics only.
+    # `lm:<corpus>` is REAL text with a real perplexity. Both are causal-LM heads.
+    lm_name = args.task.split(":", 1)[1] if args.task.startswith("lm:") else None
+    is_lm_corpus = lm_name is not None and lm_name != "synthetic"
+    if lm_name is not None and not is_lm_corpus and lm_name != "synthetic":
+        raise KeyError(f"unknown lm task {lm_name!r}; known: synthetic, {sorted(LM_CORPORA)}")
+    if is_lm_corpus and lm_name not in LM_CORPORA:
+        raise KeyError(f"unknown lm corpus {lm_name!r}; known: {sorted(LM_CORPORA)}")
     # Refuse an impossible head BEFORE tokenising a dataset or loading a model (registry
     # SEQ_CLS_REFUSES). A refusal is a correct, cheap outcome; an AttributeError 40 frames into
     # StreamBP's backward is not.
@@ -316,7 +470,26 @@ def run_one(args) -> dict:
             "with a vocab-sized cross-entropy, and a sequence-classification head has neither. "
             "Refusing rather than recording flce=1 on a run that cannot use it.")
 
-    args.seq, seq_source = resolve_seq(args.seq, is_glue, glue_name)
+    args.seq, seq_source = resolve_seq(args.seq, is_glue, glue_name, is_lm_corpus)
+
+    # ⚠ A QUALITY BENCHMARK MAY NOT EXCEED THE MODEL'S CONTEXT WINDOW. Past it, RoPE extrapolates
+    #   and the perplexity is nonsense while looking like an ordinary number: measured 149.918 at
+    #   seq 4096 against 8.171 at seq 2048 on TinyLlama (max_position_embeddings=2048), untrained.
+    #   Nothing else in the harness catches this -- the run trains, the loss is finite, the row
+    #   passes every anomaly check. Refuse instead, BEFORE the model is built.
+    #   `lm:synthetic` is exempt: it measures memory and time on random tokens and explicitly does
+    #   not report a quality number, which is what makes the §4.1 table's seq 16384 rows valid.
+    if is_lm_corpus:
+        from transformers import AutoConfig
+        _maxpos = getattr(AutoConfig.from_pretrained(args.model), "max_position_embeddings", None)
+        if _maxpos and args.seq > _maxpos:
+            raise ValueError(
+                f"--task lm:{lm_name} at --seq {args.seq} exceeds {args.model}'s "
+                f"max_position_embeddings={_maxpos}. The perplexity would be a RoPE-extrapolation "
+                f"artifact, not a quality measurement (measured on TinyLlama: 149.918 at 4096 vs "
+                f"8.171 at 2048, untrained). Use --seq <= {_maxpos}, or a longer-context model. "
+                f"For memory/throughput at longer shapes use `--task lm:synthetic`, which reports "
+                f"no quality number.")
     torch.manual_seed(args.seed)
     cfg = _cfg(args)
     device = args.device
@@ -376,6 +549,13 @@ def run_one(args) -> dict:
         train_dl, eval_dl, num_labels, task_info = build_glue_data(glue_name, tokenizer, args)
         cfg.update({"head": "seq_cls", "num_labels": num_labels, "task_name": glue_name,
                     "pad_token_id": tokenizer.pad_token_id})
+    elif is_lm_corpus:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        train_dl, eval_dl, task_info = build_lm_data(lm_name, tokenizer, args)
+        cfg.update({"head": "causal_lm", "task_name": lm_name})
 
     # ---- regime B, if asked for. ⚠ MUST PRECEDE build_model: `_apply_flce` monkey-patches the
     #      model CLASS, so a model already constructed keeps the stock fp32-logits CE.
@@ -439,7 +619,7 @@ def run_one(args) -> dict:
     engagement = verify_engagement(model, constituents, strict=not args.allow_inert)
 
     # ---- train: the harness's own step(), so the recipe matches every measured row ----
-    if is_glue:
+    if is_glue or is_lm_corpus:
         batch = None                                       # real batches come from the dataloader
     else:
         vocab = ph.hf_config(model).vocab_size
@@ -462,9 +642,30 @@ def run_one(args) -> dict:
         """The step source. `lm:synthetic` re-uses ONE fixed batch (that is deliberate -- it makes
         the computational measurement shape-exact and method-independent). GLUE streams real
         examples and re-opens the loader when the epoch ends."""
-        if not is_glue:
+        if not (is_glue or is_lm_corpus):
             while True:
                 yield batch
+        if is_lm_corpus:
+            # Packed blocks: input_ids ARE the labels; LlamaForCausalLM shifts internally.
+            #
+            # ⚠ `attention_mask` FOR StreamBP ONLY, AND THAT IS THEIR CONTRACT, NOT A WORKAROUND.
+            #   StreamBP records the mask through a wrapper that only fires when the caller passes
+            #   one (`stream_model.py:427-428`), so omitting it leaves `stream_buffer` without the
+            #   key and their attention raises `KeyError: 'attention_mask'` at `:353`. Their own
+            #   driver passes `torch.ones_like(input_ids)` (`scripts/test_bp.py:27,52`).
+            #   ⚠ NOT passed to the other arms on purpose: these blocks are packed and unpadded, so
+            #   an all-ones mask is semantically a no-op, and `build_model` deliberately relies on
+            #   transformers handing `attention_mask=None` to the sdpa path -- "exactly what that
+            #   path wants" for the `hyclora_flash`/`fb_*` arms. Passing one everywhere would
+            #   perturb arms that are already measured, to no benefit.
+            _needs_mask = type(model).__name__ == "StreamModel"
+            while True:
+                for (ids,) in train_dl:
+                    ids = ids.to(device)
+                    b = {"input_ids": ids, "labels": ids}
+                    if _needs_mask:
+                        b["attention_mask"] = torch.ones_like(ids)
+                    yield b
         while True:
             for b in train_dl:
                 yield _to_device(b, device, task_info.get("is_regression", False), _mdtype)
@@ -477,12 +678,12 @@ def run_one(args) -> dict:
     # split, so a small task (cb, 250 rows) and a large one (qnli, 105k) each get a comparable
     # amount of learning instead of an arbitrary shared step cap. `--train_steps` remains the
     # explicit override for smoke tests and for `lm:synthetic`, where there is no epoch.
-    steps_per_epoch = len(train_dl) if is_glue else 0
-    if is_glue and args.epochs:
+    steps_per_epoch = len(train_dl) if (is_glue or is_lm_corpus) else 0
+    if (is_glue or is_lm_corpus) and args.epochs:
         total_steps = max(1, steps_per_epoch * args.epochs)
     else:
         total_steps = args.train_steps
-    eval_every = steps_per_epoch if (is_glue and args.epochs) else 0
+    eval_every = steps_per_epoch if ((is_glue or is_lm_corpus) and args.epochs) else 0
 
     # ⚠ WHAT `warmup_steps` MEANS DIFFERS BY TASK, AND THE DIFFERENCE IS DELIBERATE.
     #   On `lm:synthetic` these are throwaway steps on a fixed batch, purely to reach steady state
@@ -538,11 +739,18 @@ def run_one(args) -> dict:
         #   best-over-epochs metric, and a row here that reported the final epoch would not be
         #   comparable with it. The eval runs under no_grad and is excluded from `times`.
         if eval_every and (_i + 1) % eval_every == 0 and (_i + 1) < total_steps:
-            _sc, _el, _ph_, _n = evaluate_glue(model, eval_dl, glue_name,
-                                               task_info["is_regression"], device)
-            _v = _sc.get(_metric_key)
-            if _v is not None and (best is None or _v > best[0]):
-                best = (_v, _sc, _el, _ph_, _n, (_i + 1) // eval_every)
+            if is_lm_corpus:
+                # ⚠ PERPLEXITY IS LOWER-IS-BETTER. The GLUE path keeps the MAXIMUM metric; using
+                #   that comparator here would keep the WORST epoch and report it as the best.
+                _p, _el, _n = evaluate_lm(model, eval_dl, device)
+                if best is None or _p < best[0]:
+                    best = (_p, {"perplexity": _p}, _el, None, _n, (_i + 1) // eval_every)
+            else:
+                _sc, _el, _ph_, _n = evaluate_glue(model, eval_dl, glue_name,
+                                                   task_info["is_regression"], device)
+                _v = _sc.get(_metric_key)
+                if _v is not None and (best is None or _v > best[0]):
+                    best = (_v, _sc, _el, _ph_, _n, (_i + 1) // eval_every)
 
     # ---- evaluate ----
     task_scores, pred_hist, ppl = {}, None, None
@@ -558,6 +766,18 @@ def run_one(args) -> dict:
         else:
             task_info["best_epoch"] = (total_steps // eval_every) if eval_every else None
         task_info["n_scored"] = n_scored
+        task_info["steps_per_epoch"] = steps_per_epoch
+    elif is_lm_corpus:
+        ppl, eval_loss, n_scored = evaluate_lm(model, eval_dl, device)
+        if best is not None and best[0] < ppl:
+            ppl, eval_loss, n_scored = best[0], best[2], best[4]
+            task_info["best_epoch"] = best[5]
+        else:
+            task_info["best_epoch"] = (total_steps // eval_every) if eval_every else None
+        # The corpus's OWN headline metric, so a sweep reads without knowing the task family.
+        task_scores = {"perplexity": ppl, "eval_nll": eval_loss,
+                       "n_eval_tokens_scored": n_scored,
+                       "n_train_tokens": task_info.get("n_train_tokens")}
         task_info["steps_per_epoch"] = steps_per_epoch
     else:
         model.eval()
@@ -589,7 +809,7 @@ def run_one(args) -> dict:
         "train_steps": total_steps, "lr": args.lr,
         "max_grad_norm": args.max_grad_norm, "lr_scheduler": args.lr_scheduler,
         "warmup_ratio": args.warmup_ratio,
-        "epochs": args.epochs if is_glue else None,
+        "epochs": args.epochs if (is_glue or is_lm_corpus) else None,
         "seq_source": seq_source,
         "steps_per_epoch": task_info.get("steps_per_epoch"),
         "best_epoch": task_info.get("best_epoch"),
@@ -611,9 +831,16 @@ def run_one(args) -> dict:
         "matthews_correlation": task_scores.get("matthews_correlation"),
         "pearson": task_scores.get("pearson"),
         "spearmanr": task_scores.get("spearmanr"),
-        "task_metric_name": _glue_metric_key(glue_name) if is_glue else None,
-        "task_metric": task_scores.get(_glue_metric_key(glue_name)) if is_glue else None,
-        "task_metric_json": json.dumps(task_scores, sort_keys=True, default=str) if is_glue else None,
+        # ⚠ `perplexity` here is LOWER-IS-BETTER, unlike every GLUE metric that shares this
+        #   column. Anything that ranks or gates on `task_metric` must branch on
+        #   `task_metric_name`; `check_row`'s majority-class check already guards on
+        #   `task_metric_name == "accuracy"` and so is unaffected.
+        "task_metric_name": (_glue_metric_key(glue_name) if is_glue
+                             else ("perplexity" if is_lm_corpus else None)),
+        "task_metric": (task_scores.get(_glue_metric_key(glue_name)) if is_glue
+                        else (ppl if is_lm_corpus else None)),
+        "task_metric_json": (json.dumps(task_scores, sort_keys=True, default=str)
+                             if (is_glue or is_lm_corpus) else None),
         "pred_distribution": json.dumps(pred_hist) if pred_hist is not None else None,
         "n_train_examples": task_info.get("n_train"),
         "n_eval_examples": task_info.get("n_scored", task_info.get("n_eval")),

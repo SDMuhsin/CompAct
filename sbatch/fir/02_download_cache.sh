@@ -106,7 +106,14 @@ for t in ["boolq", "cb"]:
         print(f"   ⚠ superglue/{t} UNAVAILABLE FROM EVERY CANDIDATE -- `--task glue:{t}` will fail")
 
 print("\n=== language modelling ===")
+# The corpora behind `--task lm:<corpus>` (run_production.LM_CORPORA). This is the benchmark
+# family where every published baseline is actually engaged: a causal-LM head gives StreamBP an
+# `lm_head` to chunk (it is REFUSED on a classification head) and Mini-Sequence its LM-head
+# wrapper (HALF-ENGAGED without one), and it is the only family where `--flce` / regime B applies.
 retry(lambda: load_dataset("wikitext", "wikitext-2-raw-v1"), "wikitext-2")
+# ⚠ PG-19 IS LARGE (28,602 books). `build_lm_data` caps the DOCUMENT count by default, but the
+#   cache still holds the whole split, so allow time and disk on a first run.
+retry(lambda: load_dataset("emozilla/pg19"), "pg19 (long-context; 28,602 books)")
 
 print("\n=== commonsense: train mixture + the 8 eval sets ===")
 retry(lambda: load_dataset("zwhe99/commonsense_170k"), "commonsense_170k (170,420 rows)")
@@ -188,6 +195,14 @@ for args, label in [(("glue","rte"),"glue/rte"), (("cais/mmlu","all"),"mmlu"),
     try:
         load_dataset(*args); print(f"  {label} offline: OK")
     except Exception as e: fails.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
+# ⚠ THE LM CORPORA, offline, EXACTLY as `run_production.LM_CORPORA` names them. Same lesson as the
+#   SuperGLUE block below: verifying something adjacent certifies nothing.
+for args, label in [(("wikitext", "wikitext-2-raw-v1"), "lm:wikitext2"),
+                    (("emozilla/pg19",), "lm:pg19")]:
+    try:
+        load_dataset(*args); print(f"  {label} offline: OK")
+    except Exception as e:
+        fails.append(f"{label}: {type(e).__name__}: {str(e)[:120]} -> `--task {label}` will fail")
 # ⚠ The SuperGLUE DATASETS, offline, through the same candidate list the runner uses. Verifying the
 #   metric alone (below) passed for months while the dataset was never cached at all.
 for t in ["boolq", "cb"]:

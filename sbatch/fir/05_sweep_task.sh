@@ -69,14 +69,31 @@ esac
 
 # --- the cell grid. CAMERA-READY values, matched to the pilot that validated them. --------
 P_MODEL="${P_MODEL:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
-P_TASK="${P_TASK:-boolq}"
+# TASK FAMILY. `glue` = sequence-classification head; `lm` = causal-LM head over a real corpus.
+# ⚠ THE FAMILY CHANGES WHICH BASELINES ARE MEASURABLE AT ALL -- see the header. One script serves
+#   both deliberately: every hard-won behaviour here (recorded outcomes, run_id scoping,
+#   needs_pythonpath, per-method LR/clip, the wstream guard, the fb_variant axis) is family-neutral,
+#   and a forked script would drift from it.
+P_FAMILY="${P_FAMILY:-glue}"
+case "$P_FAMILY" in
+    glue) P_TASK="${P_TASK:-boolq}" ;;
+    lm)   P_TASK="${P_TASK:-wikitext2}" ;;
+    *) echo "P_FAMILY must be glue or lm, got '$P_FAMILY'"; exit 2 ;;
+esac
 P_SEEDS="${P_SEEDS:-41 42 43}"
 P_EPOCHS="${P_EPOCHS:-3}"
 # ⚠ EMPTY ON PURPOSE: `run_production.resolve_seq` applies the measured per-task policy
 #   (128 everywhere, 384 for boolq, because at 128 boolq truncates 61.4% of its examples).
 #   The row records `seq_source` either way, so an override is always visible in the data.
 P_SEQ="${P_SEQ:-}"
-P_BATCH="${P_BATCH:-16}"
+# ⚠ PER-FAMILY BATCH. GLUE sequences are 128-384 tokens, so batch 16 is ~6k tokens/step. An LM
+#   block is `seq` tokens by construction, so batch 16 at seq 2048 would be 32k tokens/step -- 16x
+#   the §8 protocol shape and a different experiment. batch 4 x seq 2048 = 8192 tokens/step keeps
+#   the step size in the same range as the GLUE cells and near the memory table's operating point.
+case "$P_FAMILY" in
+    lm) P_BATCH="${P_BATCH:-4}" ;;
+    *)  P_BATCH="${P_BATCH:-16}" ;;
+esac
 P_LR="${P_LR:-2e-4}"
 # ⚠ RUN_ID SCOPES RESUME AND THE REPORT, AND THAT IS LOAD-BEARING -- BUMP IT WHEN THE
 #   CONFIGURATION CHANGES. `check_row` validates a row's NUMBERS, not the configuration that
@@ -86,8 +103,18 @@ P_LR="${P_LR:-2e-4}"
 #   exactly the arms that most need re-running**. Old rows are never deleted (§1); they stay under
 #   their own run_id and are ignored by both resume and the report.
 #   `_v2` = matched gc + published per-method LR + published clipping + the fb_variant axis.
-P_RUN_ID="${P_RUN_ID:-camera_ready_${P_TASK}_v2}"
-P_CSV="${P_CSV:-results/production/camera_ready_glue.csv}"
+# ⚠ THE `glue` FORM IS UNCHANGED ON PURPOSE. A glue sweep is IN FLIGHT on fir under run_id
+#   `camera_ready_boolq_v2`; adding a family prefix to it would make resume and the report scope to
+#   a run_id no existing row carries, silently orphaning that sweep's results. New families get the
+#   prefix; glue keeps the name its rows were written with.
+case "$P_FAMILY" in
+    glue) P_RUN_ID="${P_RUN_ID:-camera_ready_${P_TASK}_v2}" ;;
+    *)    P_RUN_ID="${P_RUN_ID:-camera_ready_${P_FAMILY}_${P_TASK}_v2}" ;;
+esac
+# Per-family CSV. `glue` resolves to the same path it always did, so the in-flight sweep's rows
+# stay where they are; `lm` gets its own file rather than putting causal-LM rows in a file named
+# for GLUE. The `task` column distinguishes them if they are ever concatenated.
+P_CSV="${P_CSV:-results/production/camera_ready_${P_FAMILY}.csv}"
 
 # Per-cell wall time. The pilot's heaviest arm (zero3, the only DeepSpeed-engine arm) took
 # 1243 s for 3 epochs of boolq -- the largest SuperGLUE split. 3 h is ~8.7x that, which covers
@@ -147,6 +174,26 @@ cell_lr() {
 #   (args_lomo.yaml:25), so running without it is also a deviation -- just a cheaper one. Whichever
 #   way this is set, the lomo row must say which, because it moves the memory column a lot.
 #   Default here is ON, i.e. faithful to their config; set P_CLIP_LOMO= to turn it off.
+# ⚠ REGIME B, AND IT ONLY EXISTS IN THE `lm` FAMILY. §8: "B is where competitor claims are
+#   adjudicated" -- the LM-head + fp32-CE stack is 875 MiB at seq 1024/batch 2, larger than
+#   everything the block saves, and unmatched it decides the comparison on its own. `--flce` is
+#   REFUSED on a GLUE head (no LM head, no vocab-sized logits), so every glue row is regime A by
+#   construction; a causal-LM head is the only place the choice exists.
+#   Skipped for `minis`/`streambp` (FLCE_FORBIDDEN): their own mechanism IS a chunked/fused LM head
+#   and loss, so stacking Liger's on top would be two implementations of one optimisation and would
+#   measure neither. That makes regime B the MATCHED control it is meant to be -- every arm gets a
+#   fused CE, either Liger's or its own -- rather than an asymmetry. Say so in the table.
+#   Measured on the dev box: baseline_fb lm:wikitext2 seq 2048 goes 3249.14 -> 2482.24 MiB with
+#   identical perplexity, and 2482.24 reproduces §4.1's published fb_min 2482.02 to 0.2 MiB.
+cell_flce() {
+    [ "$P_FAMILY" = "lm" ] || { echo ""; return; }
+    [ "${P_FLCE:-1}" = "1" ] || { echo ""; return; }
+    case "$1" in
+        minis|streambp) echo "" ;;            # FLCE_FORBIDDEN -- they ship their own fused head
+        *)              echo "--flce" ;;
+    esac
+}
+
 cell_clip() {
     case "$1" in
         lomo|adalomo) echo "${P_CLIP_LOMO-1.0}" ;;   # args_lomo.yaml:25
@@ -163,20 +210,22 @@ cell_clip() {
 #   It also needs pandas, which lives in the venv and not in the bare module stack.
 build_manifest() {
     P_TASK="$P_TASK" P_SEEDS="$P_SEEDS" P_CSV="$P_CSV" P_SEQ="$P_SEQ" P_RUN_ID="$P_RUN_ID" \
+    P_FAMILY="$P_FAMILY" \
     MANIFEST="$MANIFEST" "$FIR_VENV/bin/python" - <<'PY'
 import os, sys
 sys.path.insert(0, "src")
 from validate_glue_runner import arms, check_row
 from experiment_registry import FULL_FT_REGIME, LOSSY, resolve_fb_variant, CombinationRefused
-from run_production import TASK_MAX_LENGTH, GLUE_DEFAULT_SEQ
+from run_production import TASK_MAX_LENGTH, GLUE_DEFAULT_SEQ, LM_DEFAULT_SEQ
 
 task     = os.environ["P_TASK"]
 seeds    = [int(s) for s in os.environ["P_SEEDS"].split()]
 csv_path = os.environ["P_CSV"]
 run_id   = os.environ["P_RUN_ID"]
 manifest = os.environ["MANIFEST"]
-seq      = int(os.environ["P_SEQ"]) if os.environ.get("P_SEQ") else \
-           TASK_MAX_LENGTH.get(task, GLUE_DEFAULT_SEQ)
+family   = os.environ["P_FAMILY"]
+seq      = int(os.environ["P_SEQ"]) if os.environ.get("P_SEQ") else (
+           LM_DEFAULT_SEQ if family == "lm" else TASK_MAX_LENGTH.get(task, GLUE_DEFAULT_SEQ))
 
 # ⚠ SCOPED TO run_id. `check_row` validates NUMBERS, not the configuration that produced them, so
 # a row can be clean and still invalid -- sweep 1's galore/qlora/adalomo rows all pass it while
@@ -187,7 +236,7 @@ done_cells, dirty = set(), 0
 if os.path.exists(csv_path):
     import pandas as pd
     d = pd.read_csv(csv_path)
-    d = d[(d.task == f"glue:{task}") & (d.run_id == run_id)]
+    d = d[(d.task == f"{family}:{task}") & (d.run_id == run_id)]
     for _, r in d.iterrows():
         r = r.to_dict()
         key = (str(r.get("method")), int(r.get("with_fb") or 0),
@@ -235,7 +284,7 @@ for method, fb in arms():
 with open(manifest, "w") as f:
     f.write("\n".join(lines) + ("\n" if lines else ""))
 
-print(f"  task           glue:{task}   seq={seq}")
+print(f"  task           {family}:{task}   seq={seq}")
 print(f"  seeds          {seeds}")
 print(f"  cells total    {sum(len(variants_for(m, f)) for m, f in arms()) * len(seeds)}")
 print(f"  already clean  {len(done_cells)} (skipped)")
@@ -302,7 +351,7 @@ PROBE
     local prc=$?
     [ $prc -eq 0 ] || echo "  ⚠ CONTEXT PROBE FAILED (exit $prc) on $(hostname) -- see CONTEXT.md §15.2"
 
-    echo "--- cell: $tag x glue:$P_TASK seed=$seed lr=$(cell_lr "$method") clip=$(cell_clip "$method") epochs=$P_EPOCHS ---"
+    echo "--- cell: $tag x $P_FAMILY:$P_TASK seed=$seed lr=$(cell_lr "$method") clip=$(cell_clip "$method") epochs=$P_EPOCHS ---"
     local t0 rc=0 out
     t0=$(date +%s)
     # ⚠ NO --allow_inert, EVER. It writes a row for a method that proved no work, which is the
@@ -310,9 +359,10 @@ PROBE
     # Output is teed so the CLASSIFIER below can read it while the log still shows everything live.
     local _clip; _clip=$(cell_clip "$method")
     out=$(python src/run_production.py \
-        --method "$method" $fbflag --task "glue:$P_TASK" --seed "$seed" \
+        --method "$method" $fbflag --task "$P_FAMILY:$P_TASK" --seed "$seed" \
         --model "$P_MODEL" --epochs "$P_EPOCHS" ${P_SEQ:+--seq "$P_SEQ"} \
         --batch "$P_BATCH" --lr "$(cell_lr "$method")" ${_clip:+--max_grad_norm "$_clip"} \
+        $(cell_flce "$method") \
         --device cuda:0 --warmup_steps 8 \
         --run_id "$P_RUN_ID" --out_csv "$P_CSV" 2>&1 | tee /dev/stderr) || rc=1
     echo "--- $tag seed=$seed wall-clock: $(( $(date +%s) - t0 ))s  rc=$rc ---"
@@ -367,13 +417,14 @@ PROBE
 # node (--report) and from a CPU-only report job, neither of which has an activated venv.
 run_report() {
     P_TASK="$P_TASK" P_SEEDS="$P_SEEDS" P_CSV="$P_CSV" P_SEQ="$P_SEQ" OUTCOMES="$OUTCOMES" \
+    P_FAMILY="$P_FAMILY" \
     P_RUN_ID="$P_RUN_ID" "$FIR_VENV/bin/python" - <<'PY'
 import os, sys, json
 sys.path.insert(0, "src")
 import pandas as pd
 from validate_glue_runner import arms, check_row
 from experiment_registry import FULL_FT_REGIME, resolve_fb_variant, CombinationRefused
-from run_production import TASK_MAX_LENGTH, GLUE_DEFAULT_SEQ
+from run_production import TASK_MAX_LENGTH, GLUE_DEFAULT_SEQ, LM_DEFAULT_SEQ
 
 def variants_for(method, fb):
     if not fb:
@@ -388,8 +439,9 @@ def variants_for(method, fb):
 task  = os.environ["P_TASK"]
 seeds = [int(s) for s in os.environ["P_SEEDS"].split()]
 csv_path = os.environ["P_CSV"]
-seq = int(os.environ["P_SEQ"]) if os.environ.get("P_SEQ") else \
-      TASK_MAX_LENGTH.get(task, GLUE_DEFAULT_SEQ)
+family = os.environ["P_FAMILY"]
+seq = int(os.environ["P_SEQ"]) if os.environ.get("P_SEQ") else (
+      LM_DEFAULT_SEQ if family == "lm" else TASK_MAX_LENGTH.get(task, GLUE_DEFAULT_SEQ))
 
 # RECORDED outcomes, not predicted ones. `run_cell` appends a line for every cell that did not
 # produce a row, tagged REFUSED (illegal by construction) / INERT (built but proved no work) /
@@ -408,7 +460,7 @@ if not os.path.exists(csv_path):
 d = pd.read_csv(csv_path)
 # Scoped to run_id for the same reason resume is -- a clean row from a superseded configuration
 # must not be reported as a result of THIS sweep.
-d = d[(d.task == f"glue:{task}") & (d.run_id == os.environ["P_RUN_ID"])]
+d = d[(d.task == f"{family}:{task}") & (d.run_id == os.environ["P_RUN_ID"])]
 
 rows, n_ok, n_bad, n_missing, n_refused, n_error = [], 0, 0, 0, 0, 0
 for method, fb in arms():
@@ -444,7 +496,7 @@ for regime in ("peft_lora", "full_ft"):
     sel = [x for x in rows if x[0] == regime]
     if not sel:
         continue
-    print(f"\n=== {regime} — glue:{task}, seq {seq} ===")
+    print(f"\n=== {regime} — {family}:{task}, seq {seq} ===")
     print(f"  {'arm':14} {'seed':>4}  {'metric':>8} {'peak MiB':>10} {'ms/step':>9}  status")
     for _, tag, seed, status, m, p, ms in sel:
         f = lambda v, w, d=4: (f"{float(v):{w}.{d}f}" if v is not None and v == v else " " * w)
@@ -464,7 +516,7 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-echo "=== camera-ready sweep: all baselines x glue:$P_TASK ==="
+echo "=== camera-ready sweep: all baselines x $P_FAMILY:$P_TASK ==="
 echo "  model $P_MODEL   epochs $P_EPOCHS   batch $P_BATCH   lr $P_LR"
 echo "  csv   $P_CSV   run_id $P_RUN_ID"
 echo
@@ -503,9 +555,9 @@ fir_assert_env cpu || { echo "environment is not sane -- refusing to submit $N c
 
 jid=$(sbatch --parsable <<EOF
 #!/bin/bash
-#SBATCH --job-name=fir_sweep_${P_TASK}
-#SBATCH --output=./logs/fir_sweep_${P_TASK}_%A_%a.out
-#SBATCH --error=./logs/fir_sweep_${P_TASK}_%A_%a.err
+#SBATCH --job-name=fir_sweep_${P_FAMILY}_${P_TASK}
+#SBATCH --output=./logs/fir_sweep_${P_FAMILY}_${P_TASK}_%A_%a.out
+#SBATCH --error=./logs/fir_sweep_${P_FAMILY}_${P_TASK}_%A_%a.err
 #SBATCH --time=$P_TIME
 #SBATCH --gpus=$FIR_GPU_FULL
 #SBATCH --mem=$FIR_GPU_MEM
@@ -515,7 +567,8 @@ jid=$(sbatch --parsable <<EOF
 
 cd "\$SLURM_SUBMIT_DIR"
 source sbatch/fir/fir_env.sh
-export P_MODEL="$P_MODEL" P_TASK=$P_TASK P_EPOCHS=$P_EPOCHS P_SEQ="$P_SEQ"
+export P_MODEL="$P_MODEL" P_FAMILY=$P_FAMILY P_TASK=$P_TASK P_EPOCHS=$P_EPOCHS P_SEQ="$P_SEQ"
+export P_FLCE="${P_FLCE:-1}"
 export P_BATCH=$P_BATCH P_LR=$P_LR P_RUN_ID=$P_RUN_ID P_CSV=$P_CSV
 export OUTCOMES="$OUTCOMES"
 line=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$MANIFEST")
@@ -523,6 +576,7 @@ IFS=\$'\t' read -r method fb seed variant regime note <<< "\$line"
 echo "array task \$SLURM_ARRAY_TASK_ID -> \$method fb=\$fb variant=\$variant seed=\$seed (\$regime)"
 $(declare -f cell_lr)
 $(declare -f cell_clip)
+$(declare -f cell_flce)
 $(declare -f run_cell)
 run_cell "\$method" "\$fb" "\$seed" "\$variant"
 EOF
@@ -533,9 +587,9 @@ echo "submitted sweep array $jid  ($N cells, throttle %$P_THROTTLE, $P_TIME each
 # failed cell is exactly when the summary is most useful. `afterany` on the array as a whole.
 rid=$(sbatch --parsable --dependency=afterany:$jid <<EOF
 #!/bin/bash
-#SBATCH --job-name=fir_sweep_${P_TASK}_report
-#SBATCH --output=./logs/fir_sweep_${P_TASK}_report_%j.out
-#SBATCH --error=./logs/fir_sweep_${P_TASK}_report_%j.err
+#SBATCH --job-name=fir_sweep_${P_FAMILY}_${P_TASK}_report
+#SBATCH --output=./logs/fir_sweep_${P_FAMILY}_${P_TASK}_report_%j.out
+#SBATCH --error=./logs/fir_sweep_${P_FAMILY}_${P_TASK}_report_%j.err
 #SBATCH --time=0:20:00
 #SBATCH --mem=16000M
 #SBATCH --cpus-per-task=2
@@ -544,7 +598,7 @@ rid=$(sbatch --parsable --dependency=afterany:$jid <<EOF
 cd "\$SLURM_SUBMIT_DIR"
 source sbatch/fir/fir_env.sh
 fir_load_modules_cpu
-export P_TASK=$P_TASK P_SEEDS="$P_SEEDS" P_CSV=$P_CSV P_SEQ="$P_SEQ" OUTCOMES="$OUTCOMES"
+export P_FAMILY=$P_FAMILY P_TASK=$P_TASK P_SEEDS="$P_SEEDS" P_CSV=$P_CSV P_SEQ="$P_SEQ" OUTCOMES="$OUTCOMES"
 $(declare -f run_report)
 run_report
 EOF
@@ -552,6 +606,6 @@ EOF
 echo "submitted report job $rid (runs after the array, whatever it exits with)"
 echo
 echo "  watch:   squeue -j $jid"
-echo "  cells:   tail -f logs/fir_sweep_${P_TASK}_${jid}_0.out"
-echo "  report:  cat logs/fir_sweep_${P_TASK}_report_${rid}.out"
+echo "  cells:   tail -f logs/fir_sweep_${P_FAMILY}_${P_TASK}_${jid}_0.out"
+echo "  report:  cat logs/fir_sweep_${P_FAMILY}_${P_TASK}_report_${rid}.out"
 echo "  resume:  re-run this script -- clean cells are skipped, gaps are refilled"
