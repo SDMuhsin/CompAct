@@ -748,12 +748,32 @@ def build_lomo_model(arm, cfg, device, use_cache=False):
         apply_flash_block(model, keep="min")
         apply_flash_final_norm(model)
 
-    lr = 3e-4
+    # ⚠ LR COMES FROM cfg. It was hardcoded to 3e-4 here, which silently overrode `--lr` while the
+    #   runner still wrote `--lr` into the CSV's `lr` column -- so sweep 54846646's lomo/adalomo
+    #   rows claim 2e-4 and trained at 3e-4. LOMO is SGD-like (`p.add_(grad, alpha=-self.lr)`
+    #   below), and their published full-parameter SuperGLUE LR is **0.03**
+    #   (temp/lomo/lomo/config/args_lomo.yaml:20) -- 100x what the hardcode gave it, which is why
+    #   those cells barely left the majority class. AdaLomo is a DIFFERENT optimizer with a
+    #   different published LR (5e-4, temp/lomo/adalomo/instruction-tuning/train.py:145); do not
+    #   conflate them.
+    lr = float(cfg.get("lr", 3e-4))
     cls = AdaLomo if arm.startswith("adalomo") else Lomo
-    model._lomo_opt = cls(model, lr=lr)               # gradnorm left off, per README:27
+    # ⚠ `clip_grad_norm` IS NOT FREE HERE, unlike every other arm. LOMO fuses the update into the
+    #   backward, so by the time a gradient exists it has already been consumed. Their clipping is
+    #   therefore a TWO-PASS protocol: `optimizer.grad_norm(loss)` must run a full extra backward
+    #   before `fused_backward`, and their optimizer RAISES if you set the threshold and skip it
+    #   (lomo.py:165-168). That doubles LOMO's backward cost and changes its memory profile, so it
+    #   must be opt-in and disclosed in any row that uses it -- it is their published recipe
+    #   (args_lomo.yaml:25 sets clip_grad_norm 1.0), not an optimisation we can quietly skip or
+    #   quietly add. `ph.step` runs the pre-pass when this is set.
+    clip = cfg.get("max_grad_norm") or None
+    model._lomo_opt = cls(model, lr=lr, clip_grad_norm=clip) if clip else cls(model, lr=lr)
     model._lomo_lr = lr
+    model._lomo_clip = clip
     return model, {"method": f"{cls.__name__.lower()}@OpenLMLab/LOMO",
                    "regime": "FULL fine-tuning", "fused_backward": True, "lr": lr,
+                   "clip_grad_norm": clip,
+                   "clip_two_pass": bool(clip),
                    "optimizer_state": "none" if cls is Lomo else "second moment only",
                    "n_trainable_params": sum(p.numel() for p in model.parameters()
                                              if p.requires_grad)}
@@ -1033,7 +1053,13 @@ def build_zero3_model(arm, cfg, device, use_cache=False):
             "stage3_prefetch_bucket_size": 5e7,
             "stage3_max_live_parameters": 1e8,
         },
-        "optimizer": {"type": "AdamW", "params": {"lr": 2e-4}},
+        # ⚠ FROM cfg, NOT HARDCODED. The engine owns the optimizer, so `run_production`'s
+        #   `--lr` never reached it -- this read a literal 2e-4 while the CSV recorded whatever
+        #   `--lr` said. It happened to agree in sweep 54846646; it would not have on the next
+        #   sweep that changed the LR. Same defect class as the lomo hardcode.
+        "optimizer": {"type": "AdamW", "params": {"lr": float(cfg.get("lr", 2e-4))}},
+        # DeepSpeed does its own clipping; `0.0` is its documented "off".
+        "gradient_clipping": float(cfg.get("max_grad_norm") or 0.0),
         "zero_allow_untested_optimizer": True,
         "wall_clock_breakdown": False,
     }
@@ -1662,6 +1688,14 @@ def step(model, batch, opt):
         # LOMO fuses the parameter update INTO the backward: `fused_backward(loss, lr)` replaces
         # `loss.backward()` + `opt.step()` entirely (lomo/src/lomo_trainer.py:172). There is no
         # optimizer state to step and no gradient buffer to zero.
+        if getattr(model, "_lomo_clip", None):
+            # ⚠ THEIR TWO-PASS CLIPPING, AND IT COSTS A WHOLE EXTRA BACKWARD. `grad_norm(loss)`
+            #   runs its own backward to accumulate the global norm and set `clip_coef`; without
+            #   it `fused_backward` RAISES when a threshold is set (lomo.py:165-168). This is
+            #   their published recipe (args_lomo.yaml:25), not an addition of ours -- but the arm
+            #   is then paying 2 backwards per step and its throughput/memory row must say so.
+            model._lomo_opt.grad_norm(out.loss)
+            out = model(**batch)                       # the pre-pass consumed the graph
         model._lomo_opt.fused_backward(out.loss, model._lomo_lr)
         return out.loss.detach()
     if type(model).__name__ == "StreamModel":
@@ -1679,6 +1713,13 @@ def step(model, batch, opt):
         opt.zero_grad(set_to_none=True)
         return out.loss.detach()
     out.loss.backward()
+    # Gradient clipping, when the arm's published recipe asks for it (e.g. QLoRA's
+    # `max_grad_norm 0.3`, temp/qlora/qlora.py:205). Attached to the MODEL rather than passed in,
+    # so every caller of `step()` gets it without changing signature. Absent -> no clipping, which
+    # is the behaviour every already-measured row was taken under.
+    _clip = getattr(model, "_max_grad_norm", None)
+    if _clip:
+        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], _clip)
     opt.step()
     opt.zero_grad(set_to_none=True)
     return out.loss

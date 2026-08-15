@@ -244,7 +244,7 @@ def _eng_lomo(model) -> Dict:
 REGISTRY: Dict[str, MethodSpec] = {
     "baseline": MethodSpec("baseline", "{fb}", _eng_lora_baseline,
                            notes="plain LoRA; with fb this is our own arm"),
-    "qlora":    MethodSpec("qlora", "qlora_nf4{fb}", _eng_qlora,
+    "qlora":    MethodSpec("qlora", "qlora_nf4{fb}_gc_manual", _eng_qlora,
                            notes="4-bit NF4 base, double-quant, bf16 compute. LOSSY. "
                                  "`_norm32` variant reproduces their fp32-norm recipe under autocast "
                                  "and is REQUIRED for quality runs."),
@@ -268,9 +268,9 @@ REGISTRY: Dict[str, MethodSpec] = {
                                  "made the published baseline look worse than it is. The §16 "
                                  "memory rows in `results/baselines/zero3/` were already taken at "
                                  "`zero3_offload_gc_hf`, so this aligns the task layer with them."),
-    "galore":   MethodSpec("galore", "galore{fb}", _eng_galore, notes="FULL FT regime"),
-    "lomo":     MethodSpec("lomo", "lomo{fb}", _eng_lomo, notes="FULL FT regime; no optimizer state"),
-    "adalomo":  MethodSpec("adalomo", "adalomo{fb}", _eng_lomo, notes="FULL FT regime"),
+    "galore":   MethodSpec("galore", "galore{fb}_gc_manual", _eng_galore, notes="FULL FT regime"),
+    "lomo":     MethodSpec("lomo", "lomo{fb}_gc_manual", _eng_lomo, notes="FULL FT regime; no optimizer state"),
+    "adalomo":  MethodSpec("adalomo", "adalomo{fb}_gc_manual", _eng_lomo, notes="FULL FT regime"),
 }
 
 

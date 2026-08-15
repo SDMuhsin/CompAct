@@ -62,6 +62,7 @@ CSV_COLUMNS = [
     "timestamp", "run_id", "method", "with_fb", "arm", "task", "seed", "model_name_or_path",
     # --- protocol / hyperparameters ---
     "regime", "exact", "seq_len", "batch_size", "grad_accum", "train_steps", "lr",
+    "max_grad_norm", "lr_scheduler", "warmup_ratio",
     "epochs", "steps_per_epoch", "best_epoch", "seq_source",
     "lora_r", "lora_alpha", "lora_dropout", "target_modules", "adapter_dtype",
     "gc_variant", "fb_variant", "wstream_json", "flce", "attn_implementation",
@@ -109,9 +110,17 @@ def _wstream_stats(with_fb, fb_variant):
 
 
 def _cfg(args):
+    # ⚠ `lr` IS IN cfg BECAUSE TWO BUILDERS OWN THEIR OWN OPTIMIZER AND WERE IGNORING `--lr`.
+    #   `build_lomo_model` hardcoded `lr = 3e-4` (profile_hyclora.py:751) and `build_zero3_model`
+    #   hardcoded `"lr": 2e-4` in its DeepSpeed config, while this runner wrote `args.lr` into the
+    #   CSV's `lr` column for every row. So the lomo/adalomo rows of sweep 54846646 record 2e-4 and
+    #   were actually trained at 3e-4. That is the same defect class as the `flce=1`-without-FLCE
+    #   bug in §8: A VALUE THAT WAS RECORDED BUT NEVER REACHED THE KERNEL. Builders now read
+    #   `cfg["lr"]`, so there is one source of truth. **Verify the receipt, never the flag.**
     return {"model": args.model, "lora_r": args.lora_r, "seq": args.seq, "batch": args.batch,
             "iteration_threshold": 5, "softmax_outlier_ratio": 0.05,
-            "layernorm_outlier_ratio": 0.005, "q_bit": 4}
+            "layernorm_outlier_ratio": 0.005, "q_bit": 4,
+            "lr": args.lr, "max_grad_norm": args.max_grad_norm}
 
 
 # ==============================================================================================
@@ -444,6 +453,11 @@ def run_one(args) -> dict:
     else:
         opt = torch.optim.AdamW(trainable, lr=args.lr)
 
+    # Clipping is read by `ph.step` off the model, so it reaches every arm through the one harness
+    # rather than a second code path. lomo/adalomo consume it in `build_lomo_model` instead (their
+    # clipping is inside the fused backward) and DeepSpeed takes it via `gradient_clipping`.
+    model._max_grad_norm = args.max_grad_norm
+
     def _batches():
         """The step source. `lm:synthetic` re-uses ONE fixed batch (that is deliberate -- it makes
         the computational measurement shape-exact and method-independent). GLUE streams real
@@ -475,6 +489,27 @@ def run_one(args) -> dict:
     #   before timing (protocol §A.2). On GLUE they are REAL OPTIMIZATION STEPS on real examples --
     #   discarding them would discard training. They are excluded from the timing/memory statistics
     #   and counted in `train_steps_total`, so the quality number reflects every step taken.
+    # ---- LR schedule -----------------------------------------------------------------------
+    # ⚠ Built over `total_steps` ONLY -- the `warmup_steps` above are measurement warm-up on
+    #   lm:synthetic and real optimization on GLUE, but in neither case are they part of the
+    #   published recipe's schedule. `constant` with `warmup_ratio=0` is a no-op and leaves the
+    #   optimizer exactly as every previously-measured row had it.
+    sched = None
+    if args.lr_scheduler != "constant" or args.warmup_ratio > 0:
+        if type(model).__module__.startswith("deepspeed") or getattr(model, "_lomo_opt", None):
+            # Both own their update path; a torch LRScheduler wrapped around `opt` would not be
+            # consulted. Refuse rather than silently schedule nothing -- that is exactly the
+            # "recorded but never reached the kernel" failure this file keeps hitting.
+            raise NotImplementedError(
+                f"--lr_scheduler/--warmup_ratio are not wired for {method!r}: it owns its own "
+                f"optimizer (DeepSpeed engine / LOMO fused backward), so a torch scheduler over "
+                f"`opt` would be recorded and never applied. Implement it in that arm's builder "
+                f"or leave the schedule constant and disclose it.")
+        from transformers import get_scheduler
+        sched = get_scheduler(args.lr_scheduler, optimizer=opt,
+                              num_warmup_steps=int(args.warmup_ratio * total_steps),
+                              num_training_steps=total_steps)
+
     for _ in range(args.warmup_steps):
         ph.step(model, next(src), opt)
     torch.cuda.synchronize()
@@ -489,6 +524,8 @@ def run_one(args) -> dict:
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
         loss = ph.step(model, next(src), opt)
+        if sched is not None:
+            sched.step()
         torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
         peaks_a.append(torch.cuda.max_memory_allocated())
@@ -546,7 +583,12 @@ def run_one(args) -> dict:
         "regime": "full_ft" if method in FULL_FT_REGIME else "peft_lora",
         "exact": int(method not in LOSSY),
         "seq_len": args.seq, "batch_size": args.batch, "grad_accum": 1,
+        # ⚠ `lr` HERE IS THE REQUESTED VALUE. For arms that own their optimizer the AUTHORITATIVE
+        #   value is the builder's receipt (`lomo_receipt.lr`, `zero3_receipt`), which is why both
+        #   now read cfg["lr"] -- before that they hardcoded their own and this column lied.
         "train_steps": total_steps, "lr": args.lr,
+        "max_grad_norm": args.max_grad_norm, "lr_scheduler": args.lr_scheduler,
+        "warmup_ratio": args.warmup_ratio,
         "epochs": args.epochs if is_glue else None,
         "seq_source": seq_source,
         "steps_per_epoch": task_info.get("steps_per_epoch"),
@@ -625,6 +667,21 @@ def main():
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--seed", type=int, default=41)
     ap.add_argument("--warmup_steps", type=int, default=8)
+    # ⚠ THESE DEFAULT TO "OFF", WHICH IS THE BEHAVIOUR EVERY ALREADY-MEASURED ROW WAS TAKEN
+    #   UNDER. They exist because a published LR is not a published recipe: LOMO ships
+    #   `clip_grad_norm 1.0` + `warmup 0.1` + linear (args_lomo.yaml:23-25) and QLoRA ships
+    #   `max_grad_norm 0.3` + constant (qlora.py:205,208). Quoting their LR while silently
+    #   dropping the rest is the detuning §8 forbids. Set them per-arm; record them in the row.
+    ap.add_argument("--max_grad_norm", type=float, default=None,
+                    help="gradient-norm clipping. ⚠ On lomo/adalomo this enables THEIR two-pass "
+                         "protocol (an extra backward per step, lomo.py:165-168) -- it is their "
+                         "recipe, but it changes the throughput and memory columns, so say so.")
+    ap.add_argument("--lr_scheduler", default="constant",
+                    choices=["constant", "linear", "cosine"],
+                    help="LR schedule over the training steps. `constant` reproduces every row "
+                         "measured before this flag existed.")
+    ap.add_argument("--warmup_ratio", type=float, default=0.0,
+                    help="fraction of total steps spent warming the LR up from 0")
     ap.add_argument("--train_steps", type=int, default=6)
     ap.add_argument("--epochs", type=int, default=None,
                     help="GLUE: train for E passes over the task's own train split (camera-ready "
