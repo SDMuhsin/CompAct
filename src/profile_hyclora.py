@@ -997,7 +997,12 @@ def build_zero3_model(arm, cfg, device, use_cache=False):
 
     Arms:
       `zero3`          -- stage 3, params resident (partitioning is a no-op on one GPU)
-      `zero3_offload`  -- stage 3 + `offload_param={"device":"cpu","pin_memory":true}`  <- the one
+      `zero3_offload`  -- stage 3 + `offload_param={"device":"cpu","pin_memory":true}`
+
+    ⚠ ALWAYS append `_gc_hf`. Neither arm above checkpoints activations on its own, so bare
+    `zero3_offload` is a no-checkpointing arm (see the note at the `apply_checkpointing` call
+    below). **`zero3_offload_gc_hf` is the row**, and it is what `results/baselines/zero3/` holds;
+    the `zero3` MethodSpec now resolves to it directly.
 
     Fairness notes, all forced by §B:
       * bf16 engine, LoRA r=alpha=16 over the same seven projections, dropout 0, no gc -- matched.
@@ -1051,7 +1056,13 @@ def build_zero3_model(arm, cfg, device, use_cache=False):
     # afterwards the decoder layers are owned by the engine and the wrapper would not see them.
     # ZeRO-3 partitions/offloads PARAMETERS and does nothing about activations, so without this a
     # `zero3_*` row is a no-checkpointing arm and is not comparable with `fb_min` or `liger_gc_sdpa`
-    # (§B line 13). `zero3_offload_gc_manual` is therefore the row that belongs in the table.
+    # (§B line 13). `zero3_offload_gc_hf` is therefore the row that belongs in the table, and it is
+    # what `results/baselines/zero3/` was measured at.
+    #
+    # ⚠ CORRECTED 2026-08-15: this comment used to name `zero3_offload_gc_manual`, which is WRONG --
+    # `gc_manual` is `use_reentrant=False` and ZeRO-3 is incompatible with non-reentrant
+    # checkpointing (see the `zero3` MethodSpec note). The two in-repo instructions contradicted
+    # each other; the registry's was the correct one.
     _ck = apply_checkpointing(model, arm)
     engine, _opt, _, _ = deepspeed.initialize(
         model=model, model_parameters=[p for p in model.parameters() if p.requires_grad],

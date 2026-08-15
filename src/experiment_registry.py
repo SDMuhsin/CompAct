@@ -255,8 +255,19 @@ REGISTRY: Dict[str, MethodSpec] = {
                            needs_pythonpath="temp/ds_alst",
                            notes="num_shards=ceil(seq/hidden) -> NO tiling below seq 4096 on a "
                                  "2048-hidden model; that is their rule, report it as such"),
-    "zero3":    MethodSpec("zero3", "zero3_offload{fb}", _eng_zero3,
-                           notes="use gc_hf; ZeRO-3 is incompatible with non-reentrant checkpointing"),
+    "zero3":    MethodSpec("zero3", "zero3_offload_gc_hf{fb}", _eng_zero3,
+                           notes="gc_hf is MANDATORY and is baked into the arm, not left to the "
+                                 "caller: ZeRO-3 partitions/offloads PARAMETERS and does nothing "
+                                 "about activations, so a `zero3_*` arm without a gc fragment is a "
+                                 "NO-CHECKPOINTING arm whose peak is not comparable with `fb_min` "
+                                 "or `liger_gc_sdpa`. It must be `gc_hf` (use_reentrant=True) and "
+                                 "never `gc_manual`: ZeRO-3 is incompatible with non-reentrant "
+                                 "checkpointing. This template read `zero3_offload{fb}` until "
+                                 "2026-08-15, which is what fir pilot 54770596 measured -- 14427 "
+                                 "MiB at batch 16 x seq 384, an inflated number that would have "
+                                 "made the published baseline look worse than it is. The §16 "
+                                 "memory rows in `results/baselines/zero3/` were already taken at "
+                                 "`zero3_offload_gc_hf`, so this aligns the task layer with them."),
     "galore":   MethodSpec("galore", "galore{fb}", _eng_galore, notes="FULL FT regime"),
     "lomo":     MethodSpec("lomo", "lomo{fb}", _eng_lomo, notes="FULL FT regime; no optimizer state"),
     "adalomo":  MethodSpec("adalomo", "adalomo{fb}", _eng_lomo, notes="FULL FT regime"),
